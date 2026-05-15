@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Data Manager Assistant",
+  "version": "8.9.1",
+  "description": "Collects stats from two sites, merges, and prepares TSV for Google Sheets.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr7L2LuJhptndtni9ITHs4F6d5XPz1CRcgUv4stE6LpImCiizxdoNzjgpYKotyOFzEHDxH7asndXGq/Sq8CaJyv7M9oTJxu6HYj7LklPOYj76NFhRE2qeR/tpdf2vLMswyt4n8/aUuIBiLhY7uEa6CwQHqNv/5R2yMqVOn+23MBKOGjExFv5EhOqIzn4LzbIMgjSFKvMkpaeLCAwdh32db4vyXD2RRKeWAUSp7QQvi11eQjCZkV0S7URLLqJ5Djl2R7BNNGEUkfK7ou+seBa5UMnYUvOX3qSkULGsUFy2SBO1m8i2T6GztXZzWuDFEexDfH0CYPKgn9oZk13kYuOukQIDAQAB",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Data Manager Assistant"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "webRequest", "identity"],
+  "oauth2": {
+    "client_id": "561573337486-8lnb2e3nm1c7m3eko4drulebcd2ollut.apps.googleusercontent.com",
+    "scopes": ["https://www.googleapis.com/auth/spreadsheets"]
+  },
+  "host_permissions": ["https://*.trackensure.com/*", "https://*.orchard22.com/*", "<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Data Manager Assistant",
-  "version": "8.9.1",
+  "version": "8.10.0",
   "description": "Collects stats from two sites, merges, and prepares TSV for Google Sheets.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr7L2LuJhptndtni9ITHs4F6d5XPz1CRcgUv4stE6LpImCiizxdoNzjgpYKotyOFzEHDxH7asndXGq/Sq8CaJyv7M9oTJxu6HYj7LklPOYj76NFhRE2qeR/tpdf2vLMswyt4n8/aUuIBiLhY7uEa6CwQHqNv/5R2yMqVOn+23MBKOGjExFv5EhOqIzn4LzbIMgjSFKvMkpaeLCAwdh32db4vyXD2RRKeWAUSp7QQvi11eQjCZkV0S7URLLqJ5Djl2R7BNNGEUkfK7ou+seBa5UMnYUvOX3qSkULGsUFy2SBO1m8i2T6GztXZzWuDFEexDfH0CYPKgn9oZk13kYuOukQIDAQAB",
   "action": {

@@ -215,6 +215,7 @@ async function handleStartExport(payload) {
         missingAgentsList: missingAgents,
         pendingBatchData: batchData
       });
+      chrome.runtime.sendMessage({ action: "EXPORT_COMPLETED" });
       return; // Завершуємо роботу, чекаємо на підтвердження в UI
     }
 
@@ -227,6 +228,7 @@ async function handleStartExport(payload) {
     });
 
     console.log('[START_EXPORT] 9. Експорт завершено успішно!');
+    chrome.runtime.sendMessage({ action: "EXPORT_COMPLETED" });
     try {
       chrome.notifications.create({
         type: 'basic',
@@ -237,6 +239,7 @@ async function handleStartExport(payload) {
     } catch(err) { console.log('Notification error:', err); }
   } catch (err) {
     console.error('[START_EXPORT] КРИТИЧНА ПОМИЛКА:', err);
+    chrome.runtime.sendMessage({ action: "EXPORT_COMPLETED" });
     try {
       chrome.notifications.create({
         type: 'basic',
@@ -967,7 +970,50 @@ async function handleGetTsvMatrix(payload = {}) {
     return { ok: false, error: 'Немає зведених даних для TSV' };
   }
 
-  const rows = buildSheetMatrix(trackTasks, orchard, tlCache, { includeCancel5, includeShift20, selectedTLs, timezone, orchardOffset, baseDateFromMs });
+  const agentWorkHoursCache = {};
+  console.log('[START_EXPORT] Fetching Work Hours for all unique agents...');
+  try {
+    const orchardToken = await ensureOrchardToken();
+    if (orchardToken) {
+      const uniqueAgentIds = new Set();
+      orchard.forEach((entry) => {
+        const agId = entry?.agentDTO?.userId || entry?.agentDTO?.agentId || entry?.agentId || entry?.candidateId;
+        if (agId) uniqueAgentIds.add(agId);
+      });
+
+      const fetchFrom = baseDateFromMs || (Date.now() - 30 * 86400000);
+      const fetchTo = Date.now();
+
+      for (const agId of uniqueAgentIds) {
+        try {
+          const resp = await fetch('https://orchard22.com/api/calendar/work-hour/list-by-filter', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json, text/plain, */*',
+              Authorization: `Bearer ${orchardToken}`
+            },
+            body: JSON.stringify({
+              agentId: agId,
+              cutOff: true,
+              dateFrom: fetchFrom,
+              dateTo: fetchTo
+            })
+          });
+          if (resp.ok) {
+            const parsed = await resp.json();
+            agentWorkHoursCache[agId] = Array.isArray(parsed?.data) ? parsed.data : (Array.isArray(parsed) ? parsed : []);
+          }
+        } catch (e) {
+          console.error('Work Hours Error:', e);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Work Hours outer Error:', e);
+  }
+
+  const rows = buildSheetMatrix(trackTasks, orchard, tlCache, { includeCancel5, includeShift20, selectedTLs, timezone, orchardOffset, baseDateFromMs, agentWorkHoursCache });
   return { ok: true, rows };
 }
 
@@ -1167,18 +1213,19 @@ try {
         // Відстежуємо тільки таски, які відбулися 30-го або 1-го числа
         if (tDate.getDate() === 30 || tDate.getDate() === 1) {
             console.log(`\n=== ДЕБАГ ТАСКА: ${tDate.toLocaleString()} ===`);
-            console.log("1. Час таска (createDate):", task.createDate);
-            
+            console.log("1. Сирих тасків з Trackensure:", agentTasks.length);
+            console.log("2. Час таска (createDate):", task.createDate);
+
             if (matchedShift) {
-                console.log("2. Знайдено зміну:", new Date(Number(matchedShift.dateFrom)).toLocaleString(), "-", new Date(Number(matchedShift.dateTo)).toLocaleString());
-                
+                console.log("3. Знайдено зміну:", new Date(Number(matchedShift.dateFrom)).toLocaleString(), "-", new Date(Number(matchedShift.dateTo)).toLocaleString());
+
                 // Якщо у тебе далі є змінна targetDay (цільовий день для запису в колонку), виведи її:
                 if (typeof targetDay !== 'undefined') {
-                    console.log("3. Визначений targetDay для запису:", targetDay);
+                    console.log("4. Визначений targetDay для запису:", targetDay);
                 }
-            } else {
-                console.log("2. ЗМІНУ НЕ ЗНАЙДЕНО (matchedShift is undefined або false)");
-                
+              } else {
+                console.log("3. ЗМІНУ НЕ ЗНАЙДЕНО (matchedShift is undefined або false)");
+
                 // Виведемо всі зміни цього агента поруч, щоб побачити, що ми пропустили
                 console.log("   Усі зміни агента в Orchard навколо цієї дати:");
                 if (shifts && Array.isArray(shifts)) {
@@ -1190,7 +1237,7 @@ try {
                         }
                     });
                 }
-            }
+              }
         }
     }
 } catch (e) {
@@ -1245,6 +1292,54 @@ try {
         dayCellsOrg[idx] = (Number(dayCellsOrg[idx]) || 0) + (info.org || 0) || '';
       } else {
         dayCellsAgent[idx] = (Number(dayCellsAgent[idx]) || 0) + (info.tasks || 0) || '';
+      }
+    });
+
+    // КРОК 4: Підміна результату на "L" суворо за графіком
+    const agId = entry?.agentDTO?.userId || entry?.agentDTO?.agentId || entry?.agentId || entry?.candidateId;
+    const workHoursArray = options.agentWorkHoursCache?.[agId] || [];
+
+    shifts.forEach(shift => {
+      const shiftStartMs = Number(shift.dateFrom);
+      const shiftDateObj = new Date(shiftStartMs + (offsetHours || 2) * 3600000);
+
+      if (shiftDateObj.getUTCMonth() !== baseMonth || shiftDateObj.getUTCFullYear() !== baseYear) return;
+
+      const shiftDay = shiftDateObj.getUTCDate();
+      if (!shiftDay || shiftDay < 1 || shiftDay > 31) return;
+
+      const matchedWork = workHoursArray.find(wh => {
+        const whStart = wh.eventStartDTO?.eventDate || wh.eventDateMs;
+        if (!whStart) return false;
+
+        // 1. Перевіряємо збіг по дню (залишаємо як базовий фільтр)
+        const whDate = new Date(Number(whStart) + (offsetHours || 2) * 3600000);
+        const isSameDay = whDate.getUTCFullYear() === baseYear &&
+                          whDate.getUTCMonth() === baseMonth &&
+                          whDate.getUTCDate() === shiftDay;
+
+        if (!isSameDay) return false;
+
+        // 2. КРИТИЧНИЙ ФІКС: Перевіряємо різницю в часі (дельту)
+        // Фактична зміна має починатися не далі ніж +/- 4 години від запланованої
+        const timeDiffMs = Math.abs(Number(whStart) - shiftStartMs);
+        const fourHoursMs = 4 * 60 * 60 * 1000;
+
+        return timeDiffMs <= fourHoursMs;
+      });
+
+      if (matchedWork && matchedWork.workTimeMs != null && Number(matchedWork.workTimeMs) < 18000000) {
+        if (isTL) {
+          dayCellsClient[shiftDay - 1] = 'L';
+        } else {
+          dayCellsAgent[shiftDay - 1] = 'L';
+        }
+      } else {
+        if (!isTL && dayCellsAgent[shiftDay - 1] === '') {
+          dayCellsAgent[shiftDay - 1] = 0;
+        } else if (isTL && dayCellsClient[shiftDay - 1] === '') {
+          dayCellsClient[shiftDay - 1] = 0;
+        }
       }
     });
 
@@ -1616,6 +1711,5 @@ function trySendAggregateReport() {
     }
   });
  }
-
 
 

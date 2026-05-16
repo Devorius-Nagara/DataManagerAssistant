@@ -255,6 +255,16 @@ export default function ExtensionPopup() {
     }
   }, [activeTab]);
 
+  useEffect(() => {
+    const handleMessages = (msg) => {
+      if (msg?.action === 'EXPORT_COMPLETED') {
+        setIsExporting(false);
+      }
+    };
+    chrome.runtime.onMessage.addListener(handleMessages);
+    return () => chrome.runtime.onMessage.removeListener(handleMessages);
+  }, []);
+
   const addLog = (site, message, code) => {
     setLogs((prev) => [
       { id: Date.now(), time: new Date().toLocaleTimeString(), site, message, code },
@@ -470,11 +480,7 @@ export default function ExtensionPopup() {
         }
       );
 
-      // UI just shows exporting and doesn't wait (bg script will finish and show notification)
-      setTimeout(() => {
-        setIsExporting(false);
-        addLog('Sheets', 'Запит відправлено у бекграунд (Експорт розпочато).', 200);
-      }, 2000);
+      addLog('Sheets', 'Запит відправлено у бекграунд (Експорт розпочато).', 200);
     } catch (err) {
       setIsExporting(false);
       addLog('Sheets', 'Помилка авторизації: ' + err.message, 500);
@@ -637,5 +643,6 @@ export default function ExtensionPopup() {
     </div>
   );
 }
+
 
 

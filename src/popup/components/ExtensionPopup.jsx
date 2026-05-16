@@ -1,8 +1,14 @@
 import React, { useEffect, useState } from 'react';
-import { Settings, Home, FileText, CheckCircle } from 'lucide-react';
+import { Settings, Home, FileText, CheckCircle, LogOut } from 'lucide-react';
 import { getSheetsAccessToken } from '../sheetsApi.js';
-import MainTab from './MainTab.jsx';
-import SettingsTab from './SettingsTab.jsx';
+import DefaultMode from './modes/DefaultMode.jsx';
+import ShiftStatisticMode from './modes/ShiftStatisticMode.jsx';
+import WorkloadMode from './modes/WorkloadMode.jsx';
+import CustomReportsMode from './modes/CustomReportsMode.jsx';
+import DefaultSettings from './modes/DefaultSettings.jsx';
+import ShiftStatisticSettings from './modes/ShiftStatisticSettings.jsx';
+import WorkloadSettings from './modes/WorkloadSettings.jsx';
+import CustomReportsSettings from './modes/CustomReportsSettings.jsx';
 import LogsTab from './LogsTab.jsx';
 
 export default function ExtensionPopup() {
@@ -42,6 +48,13 @@ export default function ExtensionPopup() {
   const [trackensureOffset, setTrackensureOffset] = useState(2);
   const [orchardOffset, setOrchardOffset] = useState(2);
   const [debugCalibrationData, setDebugCalibrationData] = useState(null);
+  const [appMode, setAppMode] = useState('default');
+  const [isAuth, setIsAuth] = useState(true);
+
+  const handleLogout = () => {
+    chrome.runtime.sendMessage({ type: 'LOGOUT' });
+    setIsAuth(false);
+  };
 
   const showSaved = (msg = 'Збережено') => {
     setSavedHint(msg);
@@ -80,6 +93,7 @@ export default function ExtensionPopup() {
         setDateFrom(data?.popupDateFrom || '');
         setDateTo(data?.popupDateTo || '');
         if (data?.popupTimezone) setTimezone(data.popupTimezone);
+        if (data?.appMode) setAppMode(data.appMode);
         setStatus(data?.popupStatus ?? { site1: null, site2: null, merge: null });
         setSettings({ ...settings, ...(data?.popupSettings || {}) });
         setLogs(Array.isArray(data?.popupLogs) && data.popupLogs.length > 0 ? data.popupLogs : logs);
@@ -222,13 +236,13 @@ export default function ExtensionPopup() {
 
   useEffect(() => {
     if (!hydrated) return;
-    chrome.storage.local.set({ trackensureOffset });
-  }, [trackensureOffset, hydrated]);
+    chrome.storage.local.set({ appMode });
+  }, [appMode, hydrated]);
 
-  useEffect(() => {
-    if (!hydrated) return;
-    chrome.storage.local.set({ orchardOffset });
-  }, [orchardOffset, hydrated]);
+  const handleModeChange = (newMode) => {
+    setAppMode(newMode);
+    chrome.storage.local.set({ appMode: newMode });
+  };
 
   useEffect(() => {
     const ready = status.site1 === true && status.site2 === true;
@@ -578,71 +592,120 @@ export default function ExtensionPopup() {
 
       <div className="flex-1 overflow-y-auto p-3 bg-white">
         {activeTab === 'main' && (
-          <MainTab
-            dateFrom={dateFrom}
-            setDateFrom={setDateFrom}
-            dateTo={dateTo}
-            setDateTo={setDateTo}
-            status={status}
-            onFetch={handleFetchData}
-            onClear={handleClear}
-            isLoading={isLoadingFetch}
-            canInsert={canInsert}
-            onInsert={handleExportToSheets}
-            isInserting={isExporting}
-            sheetId={sheetId}
-            setSheetId={setSheetId}
-            missingAgents={missingAgentsList}
-            onConfirmMissing={handleConfirmMissing}
-            onCancelMissing={handleCancelMissing}
-          />
+          <div className="h-full">
+            {appMode === 'default' && (
+              <DefaultMode
+                dateFrom={dateFrom}
+                setDateFrom={setDateFrom}
+                dateTo={dateTo}
+                setDateTo={setDateTo}
+                status={status}
+                onFetch={handleFetchData}
+                onClear={handleClear}
+                isLoading={isLoadingFetch}
+                canInsert={canInsert}
+                onInsert={handleExportToSheets}
+                isInserting={isExporting}
+                sheetId={sheetId}
+                setSheetId={setSheetId}
+                missingAgents={missingAgentsList}
+                onConfirmMissing={handleConfirmMissing}
+                onCancelMissing={handleCancelMissing}
+              />
+            )}
+            {appMode === 'shift_statistic' && <ShiftStatisticMode />}
+            {appMode === 'workload' && <WorkloadMode />}
+            {appMode === 'custom_reports' && <CustomReportsMode />}
+          </div>
         )}
         {activeTab === 'settings' && (
-          <SettingsTab
-            settings={settings}
-            setSettings={setSettings}
-            tags={trackensureTags}
-            loadingTags={loadingTags}
-            onLoadTags={loadTags}
-            selectedTagId={selectedTagId}
-            onSelectTag={handleSelectTag}
-            trackensureSearch={trackensureSearch}
-            setTrackensureSearch={setTrackensureSearch}
-            orchardTeams={orchardTeams}
-            loadingOrchardTeams={loadingOrchardTeams}
-            onLoadOrchardTeams={loadOrchardTeams}
-            selectedTeamId={selectedTeamId}
-            onSelectTeam={handleSelectTeam}
-            orchardSearch={orchardSearch}
-            setOrchardSearch={setOrchardSearch}
-            trackensureUsers={trackensureUsers}
-            loadingTrackUsers={loadingTrackUsers}
-            onLoadTrackUsers={loadTrackUsers}
-            selectedTLs={selectedTLs}
-            tlSearch={tlSearch}
-            setTlSearch={setTlSearch}
-            onSelectTLs={(vals) => {
-              setSelectedTLs(vals);
-              showSaved();
-            }}
-            includeCancel5={includeCancel5}
-            setIncludeCancel5={setIncludeCancel5}
-            includeShift20={includeShift20}
-            setIncludeShift20={setIncludeShift20}
-            apiRangeOffset={apiRangeOffset}
-            setApiRangeOffset={setApiRangeOffset}
-            trackensureOffset={trackensureOffset}
-            setTrackensureOffset={setTrackensureOffset}
-            orchardOffset={orchardOffset}
-            setOrchardOffset={setOrchardOffset}
-            debugCalibrationData={debugCalibrationData}
-          />
+          <div className="flex flex-col h-full overflow-hidden">
+
+            {/* 1. ФІКСОВАНА ШАПКА: Перемикач режимів (В один рядок) */}
+            <div className="shrink-0 mb-2 pb-2 border-b border-gray-100 flex items-center justify-between">
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wide">
+                Режим:
+              </label>
+              <select
+                value={appMode}
+                onChange={(e) => handleModeChange(e.target.value)}
+                className="bg-transparent text-[11px] font-medium text-gray-600 border-none focus:ring-0 p-0 text-right cursor-pointer outline-none w-auto"
+              >
+                <option value="default">Default</option>
+                <option value="shift_statistic">Shift statistic</option>
+                <option value="workload">Workload</option>
+                <option value="custom_reports">Custom Reports</option>
+              </select>
+            </div>
+
+            {/* 2. СКРОЛ-ЗОНА: Динамічні налаштування */}
+            <div className="flex-1 overflow-y-auto pr-1 pb-2">
+              {appMode === 'default' && (
+                <DefaultSettings
+                  settings={settings}
+                  setSettings={setSettings}
+                  tags={trackensureTags}
+                  loadingTags={loadingTags}
+                  onLoadTags={loadTags}
+                  selectedTagId={selectedTagId}
+                  onSelectTag={handleSelectTag}
+                  trackensureSearch={trackensureSearch}
+                  setTrackensureSearch={setTrackensureSearch}
+                  orchardTeams={orchardTeams}
+                  loadingOrchardTeams={loadingOrchardTeams}
+                  onLoadOrchardTeams={loadOrchardTeams}
+                  selectedTeamId={selectedTeamId}
+                  onSelectTeam={handleSelectTeam}
+                  orchardSearch={orchardSearch}
+                  setOrchardSearch={setOrchardSearch}
+                  trackensureUsers={trackensureUsers}
+                  loadingTrackUsers={loadingTrackUsers}
+                  onLoadTrackUsers={loadTrackUsers}
+                  selectedTLs={selectedTLs}
+                  tlSearch={tlSearch}
+                  setTlSearch={setTlSearch}
+                  onSelectTLs={(vals) => {
+                    setSelectedTLs(vals);
+                    showSaved();
+                  }}
+                  includeCancel5={includeCancel5}
+                  setIncludeCancel5={setIncludeCancel5}
+                  includeShift20={includeShift20}
+                  setIncludeShift20={setIncludeShift20}
+                  apiRangeOffset={apiRangeOffset}
+                  setApiRangeOffset={setApiRangeOffset}
+                  trackensureOffset={trackensureOffset}
+                  setTrackensureOffset={setTrackensureOffset}
+                  orchardOffset={orchardOffset}
+                  setOrchardOffset={setOrchardOffset}
+                  debugCalibrationData={debugCalibrationData}
+                />
+              )}
+              {appMode === 'shift_statistic' && <ShiftStatisticSettings />}
+              {appMode === 'workload' && <WorkloadSettings />}
+              {appMode === 'custom_reports' && <CustomReportsSettings />}
+            </div>
+
+            {/* 3. ФІКСОВАНИЙ ФУТЕР: Кнопка логауту (Ультра-компактна) */}
+            <div className="shrink-0 pt-2 mt-2 border-t border-gray-100 flex justify-center">
+              {isAuth && (
+                <button
+                  onClick={handleLogout}
+                  className="flex items-center gap-1.5 text-[10px] font-medium text-gray-400 hover:text-red-500 transition-colors py-1 px-2 rounded hover:bg-red-50"
+                >
+                  <LogOut className="w-3 h-3" /> Вийти з акаунта
+                </button>
+              )}
+            </div>
+
+          </div>
         )}
         {activeTab === 'logs' && <LogsTab logs={logs} onClear={handleClearLogs} />}
       </div>
     </div>
   );
 }
+
 
 
 

@@ -154,7 +154,7 @@ export default function SettingsTab({
   setTrackensureOffset,
   orchardOffset,
   setOrchardOffset,
-  debugCalibrationData: debugCalibrationDataProp,
+  debugCalibrationData
 }) {
   const [showTagsDropdown, setShowTagsDropdown] = useState(false);
   const [showTeamsDropdown, setShowTeamsDropdown] = useState(false);
@@ -162,24 +162,6 @@ export default function SettingsTab({
   const [calibrationData, setCalibrationData] = useState(null);
   const [selectedAgent, setSelectedAgent] = useState('');
   const [selectedDay, setSelectedDay] = useState('');
-  const [isAuth, setIsAuth] = useState(false);
-
-  useEffect(() => {
-    // Auth state is now managed via launchWebAuthFlow token storage instead of getAuthToken.
-    // Assuming auth is handled when needed.
-    setIsAuth(true); // simplify for UI purposes
-  }, []);
-
-  const handleLogout = () => {
-    chrome.runtime.sendMessage({ type: 'LOGOUT' });
-    setIsAuth(false);
-  };
-
-  const handleAgentClick = (agentName) => {
-    setSelectedAgent(agentName);
-    const days = Object.keys((calibrationData || {})[agentName] || {}).sort((a, b) => Number(a) - Number(b));
-    setSelectedDay(days[0] || '');
-  };
 
   const filteredTags = useMemo(() => {
     const q = trackensureSearch.trim().toLowerCase();
@@ -259,10 +241,10 @@ export default function SettingsTab({
   }, []);
 
   useEffect(() => {
-    if (debugCalibrationDataProp && Object.keys(debugCalibrationDataProp).length > 0) {
-      handleData(debugCalibrationDataProp);
+    if (debugCalibrationData && Object.keys(debugCalibrationData).length > 0) {
+      handleData(debugCalibrationData);
     }
-  }, [debugCalibrationDataProp]);
+  }, [debugCalibrationData]);
 
   const selectedCalibration = selectedAgent && selectedDay ? (calibrationData || {})[selectedAgent]?.[selectedDay] || null : null;
 
@@ -507,17 +489,6 @@ export default function SettingsTab({
             includeCancel5={includeCancel5}
           />
         </div>
-
-        {isAuth && (
-          <div className="border-t pt-2 mt-2">
-            <button
-              onClick={handleLogout}
-              className="w-full bg-red-100 hover:bg-red-200 text-red-700 px-3 py-1.5 rounded-md text-xs font-medium transition-colors border border-red-200"
-            >
-              Вийти з акаунта Google
-            </button>
-          </div>
-        )}
       </div>
     </div>
   );

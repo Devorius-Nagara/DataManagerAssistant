@@ -1,8 +1,8 @@
 import React from 'react';
 import { Download, Trash2, Loader2, Table as TableIcon, AlertTriangle } from 'lucide-react';
-import StatusItem from './StatusItem.jsx';
+import StatusItem from '../StatusItem.jsx';
 
-export default function MainTab({
+export default function DefaultMode({
   dateFrom,
   setDateFrom,
   dateTo,
@@ -70,8 +70,8 @@ export default function MainTab({
       </div>
 
       <div className="space-y-2 pt-3 border-t border-gray-100">
-        <StatusItem label="Дані сайту 1" state={status.site1} successText="Скопійовано" errorText="Помилка" pendingText="Не скопійовано" />
-        <StatusItem label="Дані сайту 2" state={status.site2} successText="Скопійовано" errorText="Помилка" pendingText="Не скопійовано" />
+        <StatusItem label="TrackEnsure" state={status.site1} successText="Скопійовано" errorText="Помилка" pendingText="Не скопійовано" />
+        <StatusItem label="Orchard" state={status.site2} successText="Скопійовано" errorText="Помилка" pendingText="Не скопійовано" />
         {missingAgents && missingAgents.length > 0 ? (
           <div className="border border-amber-300 bg-amber-50 text-amber-800 rounded-md p-2 space-y-1.5">
             <div className="flex items-center gap-1.5 text-xs font-semibold">

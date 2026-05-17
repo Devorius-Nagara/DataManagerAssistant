@@ -1,0 +1,162 @@
+import { logToPopup, readFromStorage, safeParse, DATA_KEYS } from '../shared.js';
+
+const ORCHARD_BASE = 'https://orchard22.com';
+const ORCHARD_TEAMS_URL = `${ORCHARD_BASE}/api/team/lt/select`;
+const ORCHARD_SHIFTS_URL = `${ORCHARD_BASE}/api/agent-shift/agent-schedule-shift-calendar-list-by-filter-page-number?tagRequired=true`;
+const ORCHARD_WORK_HOURS_URL = `${ORCHARD_BASE}/api/calendar/work-hour/list-by-filter`;
+const ORCHARD_CAPTURE_FILTER = { urls: ['https://*.orchard22.com/*'] };
+
+chrome.webRequest.onSendHeaders.addListener(
+  (details) => {
+    const authHeader = (details.requestHeaders || []).find((h) => h.name.toLowerCase() === 'authorization');
+    if (authHeader && authHeader.value && authHeader.value.startsWith('Bearer ')) {
+      const token = authHeader.value.replace('Bearer ', '').trim();
+      console.log('Captured Orchard Bearer token', { tokenPreview: token.slice(0, 12) + '...' });
+      chrome.storage.local.set({ orchardToken: token });
+      logToPopup('Сайт 2', 'Отримано Bearer токен автоматично', 200);
+    }
+  },
+  ORCHARD_CAPTURE_FILTER,
+  ['requestHeaders', 'extraHeaders']
+);
+
+export async function ensureOrchardToken() {
+  const existing = await readFromStorage('orchardToken');
+  if (existing) return existing;
+  logToPopup('Сайт 2', 'Очікування Bearer токена...', null);
+  const tokenPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      chrome.storage.onChanged.removeListener(listener);
+      reject(new Error('Таймаут очікування токена'));
+    }, 15000);
+    const listener = (changes, area) => {
+      if (area === 'local' && changes.orchardToken?.newValue) {
+        clearTimeout(timeout);
+        chrome.storage.onChanged.removeListener(listener);
+        resolve(changes.orchardToken.newValue);
+      }
+    };
+    chrome.storage.onChanged.addListener(listener);
+  });
+
+  const tabs = await chrome.tabs.query({ url: '*://*.orchard22.com/*' });
+  if (tabs && tabs.length) {
+    chrome.tabs.reload(tabs[0].id);
+  } else {
+    chrome.tabs.create({ url: 'https://orchard22.com/' });
+  }
+  return tokenPromise;
+}
+
+export async function fetchOrchardTeams() {
+  const token = await ensureOrchardToken();
+  if (!token) throw new Error('Відсутній Orchard токен');
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/plain, */*',
+    Authorization: `Bearer ${token}`,
+  };
+  logToPopup('Сайт 2', 'Відправка запиту за командами', null, {});
+  const res = await fetch(ORCHARD_TEAMS_URL, { method: 'POST', credentials: 'include', headers, body: JSON.stringify({}) });
+  const status = res.status;
+  const textBody = await res.text();
+  if (!res.ok) {
+    console.error('Orchard teams HTTP error', { status, textBody });
+    logToPopup('Сайт 2', 'HTTP помилка команд', status, { textBody });
+    throw new Error(`HTTP ${status}`);
+  }
+  const data = safeParse(textBody);
+  console.log('Orchard raw teams', { status, data, preview: textBody.slice(0, 500) });
+  if (!Array.isArray(data)) {
+    logToPopup('Сайт 2', 'Неочікувана відповідь команд', status, { textBody });
+    throw new Error('Невірний формат команд');
+  }
+  return data;
+}
+
+export async function fetchAllOrchardShifts({ teamId, dateFromMs, dateToMs }) {
+  const token = await ensureOrchardToken();
+  if (!token) throw new Error('Відсутній Orchard токен');
+  const dateFrom = dateFromMs || Date.now();
+  const dateTo = dateToMs || Date.now();
+  const payload = {
+    dateFrom,
+    dateTo,
+    onlyCandidate: false,
+    showRejectedDayOff: false,
+    departmentIdSet: [2],
+    teamIdSet: [teamId],
+    agentIdSet: [],
+    candidateIdSet: [],
+    tagNameSet: [],
+    teUserIdSet: [],
+    pageNumber: 1,
+    limitOnPage: null,
+    activeStatus: 'Active',
+  };
+  logToPopup('Сайт 2', 'Початок збору змін', null, { teamId, dateFrom, dateTo });
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/plain, */*',
+    Authorization: `Bearer ${token}`,
+  };
+  const res = await fetch(ORCHARD_SHIFTS_URL, { method: 'POST', credentials: 'include', headers, body: JSON.stringify(payload) });
+  const status = res.status;
+  const textBody = await res.text();
+  if (!res.ok) {
+    console.error('Orchard shifts HTTP error', { status, textBody });
+    logToPopup('Сайт 2', 'HTTP помилка змін', status, { textBody });
+    throw new Error(`HTTP ${status}`);
+  }
+  const data = safeParse(textBody);
+  console.log('Orchard raw shifts', { status, data, preview: textBody.slice(0, 500) });
+  const tasks = Array.isArray(data?.agentScheduleShiftCalendarDTOList)
+    ? data.agentScheduleShiftCalendarDTOList
+    : Array.isArray(data?.data?.agentScheduleShiftCalendarDTOList)
+    ? data.data.agentScheduleShiftCalendarDTOList
+    : [];
+  console.log('Orchard parsed shifts array', tasks);
+  if (!tasks.length) {
+    logToPopup('Сайт 2', 'Отримано 0 записів Orchard', status || 200, { textBody });
+  } else {
+    const sample = tasks[0] || {};
+    logToPopup(
+      'Сайт 2',
+      `Отримано ${tasks.length} записів. Приклад: Agent: ${sample.agentName || sample.agentId}, Date: ${sample.shiftDate}, Status: ${sample.shiftStatus}`,
+      status || 200
+    );
+  }
+  chrome.storage.local.set({ [DATA_KEYS.site2]: tasks });
+  return tasks;
+}
+
+export async function fetchAgentWorkHours({ token, agentIds, dateFromMs, dateToMs }) {
+  const cache = {};
+  const fetchFrom = dateFromMs || (Date.now() - 30 * 86400000);
+  const fetchTo = dateToMs || Date.now();
+  for (const agId of agentIds) {
+    try {
+      const resp = await fetch(ORCHARD_WORK_HOURS_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/plain, */*',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          agentId: agId,
+          cutOff: true,
+          dateFrom: fetchFrom,
+          dateTo: fetchTo,
+        }),
+      });
+      if (resp.ok) {
+        const parsed = await resp.json();
+        cache[agId] = Array.isArray(parsed?.data) ? parsed.data : (Array.isArray(parsed) ? parsed : []);
+      }
+    } catch (e) {
+      console.error('Work Hours Error:', e);
+    }
+  }
+  return cache;
+}

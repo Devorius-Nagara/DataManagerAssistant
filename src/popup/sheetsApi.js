@@ -16,7 +16,6 @@ export function getSheetsAccessToken() {
       }
 
       const redirectUri = chrome.identity.getRedirectURL('oauth2');
-      console.log("УВАГА! Додайте цей URL у розділ 'Authorized redirect URIs' в Google Cloud:", redirectUri);
 
       const authUrl = `${GOOGLE_AUTH_BASE}?client_id=${encodeURIComponent(CLIENT_ID)}&response_type=token&redirect_uri=${encodeURIComponent(
         redirectUri

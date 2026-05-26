@@ -46,7 +46,6 @@ export async function fetchTrackensureUsers() {
     throw new Error(`HTTP ${status}`);
   }
   const data = safeParse(textBody);
-  console.log('Trackensure raw users', { status, data, preview: textBody.slice(0, 500) });
   if (!Array.isArray(data)) return [];
   chrome.storage.local.set({ [STORAGE_USERS_KEY]: data });
   return data;
@@ -152,6 +151,7 @@ async function fetchTasksPaginated({ dateFrom, dateTo, tagId, taskTeamLeaderId, 
   const all = [];
   let beforeTaskId = null;
   let isFirstPage = true;
+  let totalBytes = 0;
   while (true) {
     const url = isFirstPage ? TASKS_FIRST_URL : TASKS_NEXT_URL;
     const payload = isFirstPage
@@ -176,14 +176,11 @@ async function fetchTasksPaginated({ dateFrom, dateTo, tagId, taskTeamLeaderId, 
           taskOwnerId: null,
           createdBy: null,
         };
-    if (isFirstPage) console.log('=== API PAYLOAD ===', payload);
-    logToPopup('Сайт 1', `Запит сторінки ${isFirstPage ? 1 : 'next'}`, null, payload);
+    logToPopup('Сайт 1', `Запит сторінки ${isFirstPage ? 1 : 'next'}`, null);
     const { data, status, textBody } = await fetchJson(url, payload);
-    console.log('Trackensure raw response', { url, status, payload, data, textBodyPreview: textBody?.slice(0, 500) });
     const tasks = normalizeTasks(data);
-    console.log('Trackensure parsed tasks array', tasks);
     if (!Array.isArray(tasks) || tasks.length === 0) {
-      logToPopup('Сайт 1', 'Отримано 0 записів', status || 200, { textBody, taskTeamLeaderId, tagId });
+      logToPopup('Сайт 1', 'Отримано 0 записів', status || 200, { taskTeamLeaderId, tagId });
       break;
     }
     const enriched = tasks.map((t) => ({ ...t, origin: origin?.type || 'tag', originTLId: origin?.tlId, originTLName: origin?.tlName }));
@@ -194,8 +191,9 @@ async function fetchTasksPaginated({ dateFrom, dateTo, tagId, taskTeamLeaderId, 
       status || 200
     );
     all.push(...enriched);
+    totalBytes += textBody.length;
+    chrome.runtime.sendMessage({ type: 'FETCH_PROGRESS', site: 'site1', count: all.length, totalBytes });
     beforeTaskId = tasks[tasks.length - 1]?.taskId;
-    logToPopup('Сайт 1', 'Накопичено записів', null, { total: all.length, beforeTaskId });
     if (!beforeTaskId) break;
     isFirstPage = false;
   }

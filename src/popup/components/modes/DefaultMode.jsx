@@ -1,6 +1,45 @@
-import React from 'react';
-import { Download, Trash2, Loader2, Table as TableIcon, AlertTriangle } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Download, Trash2, Table as TableIcon, AlertTriangle } from 'lucide-react';
 import StatusItem from '../StatusItem.jsx';
+
+// Анімований прогрес-бар: заповнюється до 85% за 20 секунд (ease-out),
+// потім пульсує до отримання фінальної відповіді.
+function ExportProgressBar({ label }) {
+  const [pct, setPct] = useState(0);
+  const [phase, setPhase] = useState('filling');
+
+  useEffect(() => {
+    const startTime = Date.now();
+    const PHASE1_MS = 20000;
+    const TARGET = 85;
+
+    const id = setInterval(() => {
+      const t = Math.min((Date.now() - startTime) / PHASE1_MS, 1);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setPct(eased * TARGET);
+      if (t >= 1) {
+        clearInterval(id);
+        setPhase('waiting');
+      }
+    }, 80);
+
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <div className="w-full space-y-1.5 py-0.5">
+      <div className="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+        <div
+          className={`h-full bg-emerald-500 rounded-full transition-all duration-300 ease-out${phase === 'waiting' ? ' animate-pulse' : ''}`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <p className="text-center text-[10px] text-gray-500 leading-tight">
+        {phase === 'filling' ? (label || 'Записую в таблицю...') : 'Очікую відповіді від Google...'}
+      </p>
+    </div>
+  );
+}
 
 export default function DefaultMode({
   dateFrom,
@@ -19,7 +58,12 @@ export default function DefaultMode({
   missingAgents,
   onConfirmMissing,
   onCancelMissing,
+  isFetchingTrackensure,
+  isFetchingOrchard,
+  site1FetchBytes,
+  site2FetchBytes,
 }) {
+
   return (
     <div className="space-y-3">
       <div className="space-y-1">
@@ -59,7 +103,7 @@ export default function DefaultMode({
           disabled={isLoading}
           className="flex-1 flex items-center justify-center gap-1.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
         >
-          {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} {isLoading ? 'Зчитування...' : 'Зчитати'}
+          <Download className="w-4 h-4" /> {isLoading ? 'Зчитування...' : 'Зчитати'}
         </button>
         <button
           onClick={onClear}
@@ -70,38 +114,63 @@ export default function DefaultMode({
       </div>
 
       <div className="space-y-2 pt-3 border-t border-gray-100">
-        <StatusItem label="TrackEnsure" state={status.site1} successText="Скопійовано" errorText="Помилка" pendingText="Не скопійовано" />
-        <StatusItem label="Orchard" state={status.site2} successText="Скопійовано" errorText="Помилка" pendingText="Не скопійовано" />
+        <StatusItem
+          label="TrackEnsure"
+          state={status.site1}
+          successText="Зчитано"
+          errorText="Помилка"
+          pendingText="Не зчитано"
+          isFetching={isFetchingTrackensure}
+          fetchBytes={site1FetchBytes}
+        />
+        <StatusItem
+          label="Orchard"
+          state={status.site2}
+          successText="Зчитано"
+          errorText="Помилка"
+          pendingText="Не зчитано"
+          isFetching={isFetchingOrchard}
+          fetchBytes={site2FetchBytes}
+        />
+
         {missingAgents && missingAgents.length > 0 ? (
           <div className="border border-amber-300 bg-amber-50 text-amber-800 rounded-md p-2 space-y-1.5">
             <div className="flex items-center gap-1.5 text-xs font-semibold">
               <AlertTriangle className="w-4 h-4" /> Наступних агентів не знайдено у таблиці:
             </div>
             <div className="text-xs break-words">{missingAgents.join(', ')}</div>
-            <div className="flex gap-1.5">
-              <button
-                onClick={onConfirmMissing}
-                className="flex-1 inline-flex items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white px-2.5 py-1.5 rounded-md text-xs font-medium"
-              >
-                Продовжити без них
-              </button>
-              <button
-                onClick={onCancelMissing}
-                className="flex-1 inline-flex items-center justify-center gap-1.5 bg-gray-100 hover:bg-gray-200 text-gray-800 px-2.5 py-1.5 rounded-md text-xs font-medium border"
-              >
-                Скасувати
-              </button>
-            </div>
+            {isInserting ? (
+              <ExportProgressBar label="Записую без пропущених агентів..." />
+            ) : (
+              <div className="flex gap-1.5">
+                <button
+                  onClick={onConfirmMissing}
+                  className="flex-1 inline-flex items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white px-2.5 py-1.5 rounded-md text-xs font-medium"
+                >
+                  Продовжити без них
+                </button>
+                <button
+                  onClick={onCancelMissing}
+                  className="flex-1 inline-flex items-center justify-center gap-1.5 bg-gray-100 hover:bg-gray-200 text-gray-800 px-2.5 py-1.5 rounded-md text-xs font-medium border"
+                >
+                  Скасувати
+                </button>
+              </div>
+            )}
           </div>
         ) : (
           canInsert && (
-            <button
-              onClick={onInsert}
-              disabled={isInserting || !sheetId}
-              className="w-full inline-flex items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
-            >
-              {isInserting ? <Loader2 className="w-4 h-4 animate-spin" /> : <TableIcon className="w-4 h-4" />} {isInserting ? 'Експортуємо...' : 'Експортувати в Sheets'}
-            </button>
+            isInserting ? (
+              <ExportProgressBar />
+            ) : (
+              <button
+                onClick={onInsert}
+                disabled={!sheetId}
+                className="w-full inline-flex items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
+              >
+                <TableIcon className="w-4 h-4" /> Експортувати в Sheets
+              </button>
+            )
           )
         )}
       </div>

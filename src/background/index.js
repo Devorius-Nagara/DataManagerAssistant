@@ -107,9 +107,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
     case 'EXECUTE_SHEETS_BATCH': {
-      executeSheetsBatch(message.payload)
-        .then((resp) => sendResponse(resp))
-        .catch((err) => sendResponse({ ok: false, error: err?.message || 'Помилка запису в Sheets' }));
+      (async () => {
+        try {
+          await chrome.storage.local.set({ exportInProgress: true, exportStartedAt: Date.now() });
+
+          const { sheetId, token } = message.payload || {};
+          let { batchUpdateData } = message.payload || {};
+
+          // Fallback: якщо payload не містить даних (велике повідомлення відхилено браузером),
+          // завантажуємо batchUpdateData з storage де воно вже збережено з START_EXPORT
+          if (!Array.isArray(batchUpdateData) || !batchUpdateData.length) {
+            const stored = await chrome.storage.local.get(['pendingBatchData']);
+            batchUpdateData = stored.pendingBatchData;
+          }
+
+          console.log('[EXECUTE_SHEETS_BATCH] Записую', batchUpdateData?.length ?? 0, 'діапазонів');
+          const resp = await executeSheetsBatch({ sheetId, token, batchUpdateData });
+
+          await chrome.storage.local.remove(['exportInProgress', 'exportStartedAt', 'missingAgentsList', 'pendingBatchData']);
+          chrome.runtime.sendMessage({ action: 'EXPORT_COMPLETED' });
+          sendResponse({ ok: true, result: resp });
+        } catch (err) {
+          console.error('[EXECUTE_SHEETS_BATCH] помилка:', err);
+          await chrome.storage.local.remove(['exportInProgress', 'exportStartedAt']);
+          chrome.runtime.sendMessage({ action: 'EXPORT_COMPLETED', error: err?.message || 'Помилка запису в Sheets' });
+          sendResponse({ ok: false, error: err?.message || 'Помилка запису в Sheets' });
+        }
+      })();
+      return true;
+    }
+    case 'GET_EXPORT_STATUS': {
+      chrome.storage.local.get(['exportInProgress', 'exportStartedAt'], (data) => {
+        const MAX_MS = 180000;
+        const isActive = Boolean(data.exportInProgress) &&
+                         Boolean(data.exportStartedAt) &&
+                         Date.now() - data.exportStartedAt < MAX_MS;
+        sendResponse({ ok: true, isActive, startedAt: data.exportStartedAt || null });
+      });
       return true;
     }
     case 'START_EXPORT': {
@@ -143,19 +177,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function handleStartExport(payload) {
   try {
-    console.log('[START_EXPORT] 1. Початок виконання. Токен Google передано з Popup...');
     const token = payload.token;
     if (!token) {
       throw new Error('Не отримано токен з Popup!');
     }
-    console.log('[START_EXPORT] 2. Токен Гугл отримано успішно!');
 
-    console.log('[START_EXPORT] 3. Формування TSV матриці (зведення даних)...');
     const matrixResp = await handleGetTsvMatrix(payload);
     if (!matrixResp.ok) throw new Error(matrixResp.error || 'Failed to get matrix');
-    console.log('[START_EXPORT] 4. Матриця сформована успішно!');
 
-    console.log('[START_EXPORT] 5. Валідація і мапінг для Google Sheets...');
     const validationResp = await validateSheetsMapping({
       rows: matrixResp.rows,
       sheetId: payload.sheetId,
@@ -163,7 +192,6 @@ async function handleStartExport(payload) {
       utcOffset: payload.orchardOffset
     });
     if (!validationResp.ok) throw new Error(validationResp.error || 'Failed validation');
-    console.log('[START_EXPORT] 6. Мапінг успішний!');
 
     const batchData = validationResp.batchUpdateData;
     const missingAgents = validationResp.missingAgents || [];
@@ -173,26 +201,21 @@ async function handleStartExport(payload) {
     }
 
     if (missingAgents.length > 0) {
-      // КРОК 1: Якщо є відсутні агенти, зберігаємо їх у пам'ять і не записуємо відразу
-      console.log('[START_EXPORT] 7. Знайдено відсутніх агентів, зберігаємо в пам\'ять:', missingAgents);
       await chrome.storage.local.set({
         missingAgentsList: missingAgents,
         pendingBatchData: batchData
       });
-      chrome.runtime.sendMessage({ action: "EXPORT_COMPLETED" });
-      return; // Завершуємо роботу, чекаємо на підтвердження в UI
+      chrome.runtime.sendMessage({ action: 'EXPORT_COMPLETED' });
+      return;
     }
 
-    console.log('[START_EXPORT] 8. Виконання batchUpdate...');
-    // Якщо відсутніх немає — виконуємо відразу
     await executeSheetsBatch({
       sheetId: payload.sheetId,
       token,
       batchUpdateData: batchData
     });
 
-    console.log('[START_EXPORT] 9. Експорт завершено успішно!');
-    chrome.runtime.sendMessage({ action: "EXPORT_COMPLETED" });
+    chrome.runtime.sendMessage({ action: 'EXPORT_COMPLETED' });
     try {
       chrome.notifications.create({
         type: 'basic',
@@ -200,10 +223,10 @@ async function handleStartExport(payload) {
         title: 'Експорт завершено',
         message: 'Статистику успішно записано у Google Таблицю!'
       });
-    } catch(err) { console.log('Notification error:', err); }
+    } catch { /* ignore notification errors */ }
   } catch (err) {
-    console.error('[START_EXPORT] КРИТИЧНА ПОМИЛКА:', err);
-    chrome.runtime.sendMessage({ action: "EXPORT_COMPLETED" });
+    console.error('[START_EXPORT] помилка:', err);
+    chrome.runtime.sendMessage({ action: 'EXPORT_COMPLETED', error: err.message || 'Невідома помилка' });
     try {
       chrome.notifications.create({
         type: 'basic',
@@ -211,7 +234,7 @@ async function handleStartExport(payload) {
         title: 'Помилка експорту',
         message: err.message || 'Невідома помилка'
       });
-    } catch(notifErr) { console.log('Notification error:', notifErr); }
+    } catch { /* ignore notification errors */ }
   }
 }
 
@@ -262,7 +285,6 @@ async function handleGetTsvMatrix(payload = {}) {
   }
 
   let agentWorkHoursCache = {};
-  console.log('[START_EXPORT] Fetching Work Hours for all unique agents...');
   try {
     const orchardToken = await ensureOrchardToken();
     if (orchardToken) {
@@ -291,14 +313,11 @@ async function validateSheetsMapping(payload = {}) {
   const { rows, sheetId, token, targetMonth, targetYear, utcOffset = 0 } = payload || {};
   if (!sheetId || !token || !Array.isArray(rows)) throw new Error('sheetId, token або дані відсутні');
   const monthYear = inferMonthYear(targetMonth, targetYear, site1Cache, site2Cache);
-  console.log('[ДЕБАГ] Місяць для мапінгу:', monthYear, 'UTC Offset:', utcOffset);
   const sheet = await fetchSheetValuesBg(sheetId, token);
   const { updates, missingAgents } = mapMatrixToUpdatesBg(rows, sheet, monthYear, utcOffset);
-  console.log('[КРОК 1 - БЕКГРАУНД] Зібрані дані для запису:', updates);
   if (!updates.length) {
-    console.error('КРИТИЧНА ПОМИЛКА: Цикл мапінгу не зібрав ЖОДНОГО агента!');
+    console.warn('[validateSheetsMapping] Цикл мапінгу не зібрав жодного агента');
   }
-  console.log('Sheets validation', { missingCount: missingAgents.length, updateCount: updates.length });
   return { ok: true, missingAgents, batchUpdateData: updates };
 }
 

@@ -11,7 +11,6 @@ chrome.webRequest.onSendHeaders.addListener(
     const authHeader = (details.requestHeaders || []).find((h) => h.name.toLowerCase() === 'authorization');
     if (authHeader && authHeader.value && authHeader.value.startsWith('Bearer ')) {
       const token = authHeader.value.replace('Bearer ', '').trim();
-      console.log('Captured Orchard Bearer token', { tokenPreview: token.slice(0, 12) + '...' });
       chrome.storage.local.set({ orchardToken: token });
       logToPopup('Сайт 2', 'Отримано Bearer токен автоматично', 200);
     }
@@ -66,7 +65,6 @@ export async function fetchOrchardTeams() {
     throw new Error(`HTTP ${status}`);
   }
   const data = safeParse(textBody);
-  console.log('Orchard raw teams', { status, data, preview: textBody.slice(0, 500) });
   if (!Array.isArray(data)) {
     logToPopup('Сайт 2', 'Неочікувана відповідь команд', status, { textBody });
     throw new Error('Невірний формат команд');
@@ -109,15 +107,13 @@ export async function fetchAllOrchardShifts({ teamId, dateFromMs, dateToMs }) {
     throw new Error(`HTTP ${status}`);
   }
   const data = safeParse(textBody);
-  console.log('Orchard raw shifts', { status, data, preview: textBody.slice(0, 500) });
   const tasks = Array.isArray(data?.agentScheduleShiftCalendarDTOList)
     ? data.agentScheduleShiftCalendarDTOList
     : Array.isArray(data?.data?.agentScheduleShiftCalendarDTOList)
     ? data.data.agentScheduleShiftCalendarDTOList
     : [];
-  console.log('Orchard parsed shifts array', tasks);
   if (!tasks.length) {
-    logToPopup('Сайт 2', 'Отримано 0 записів Orchard', status || 200, { textBody });
+    logToPopup('Сайт 2', 'Отримано 0 записів Orchard', status || 200);
   } else {
     const sample = tasks[0] || {};
     logToPopup(
@@ -125,6 +121,7 @@ export async function fetchAllOrchardShifts({ teamId, dateFromMs, dateToMs }) {
       `Отримано ${tasks.length} записів. Приклад: Agent: ${sample.agentName || sample.agentId}, Date: ${sample.shiftDate}, Status: ${sample.shiftStatus}`,
       status || 200
     );
+    chrome.runtime.sendMessage({ type: 'FETCH_PROGRESS', site: 'site2', count: tasks.length, totalBytes: textBody.length });
   }
   chrome.storage.local.set({ [DATA_KEYS.site2]: tasks });
   return tasks;

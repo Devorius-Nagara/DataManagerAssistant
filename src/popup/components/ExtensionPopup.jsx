@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Settings, Home, FileText, CheckCircle, LogOut } from 'lucide-react';
 import { getSheetsAccessToken } from '../sheetsApi.js';
 import DefaultMode from './modes/DefaultMode.jsx';
@@ -50,6 +50,9 @@ export default function ExtensionPopup() {
   const [debugCalibrationData, setDebugCalibrationData] = useState(null);
   const [appMode, setAppMode] = useState('default');
   const [isAuth, setIsAuth] = useState(true);
+  const [fetchBytes, setFetchBytes] = useState({ site1: 0, site2: 0 });
+  const [activeFetchSite, setActiveFetchSite] = useState(null);
+  const exportTimeoutRef = useRef(null);
 
   const handleLogout = () => {
     chrome.runtime.sendMessage({ type: 'LOGOUT' });
@@ -143,11 +146,11 @@ export default function ExtensionPopup() {
       if (changes.debugCalibrationData?.newValue !== undefined) {
         setDebugCalibrationData(changes.debugCalibrationData.newValue);
       }
-      if (changes.missingAgentsList?.newValue !== undefined) {
-        setMissingAgentsList(changes.missingAgentsList.newValue);
+      if ('missingAgentsList' in changes) {
+        setMissingAgentsList(changes.missingAgentsList?.newValue || []);
       }
-      if (changes.pendingBatchData?.newValue !== undefined) {
-        setPendingBatchData(changes.pendingBatchData.newValue);
+      if ('pendingBatchData' in changes) {
+        setPendingBatchData(changes.pendingBatchData?.newValue || []);
       }
     };
     chrome.storage.onChanged.addListener(listener);
@@ -251,15 +254,21 @@ export default function ExtensionPopup() {
   }, [status.site1, status.site2]);
 
   useEffect(() => {
-    const listener = (changes, area) => {
-      if (area !== 'local') return;
-      if (changes.debugCalibrationData?.newValue !== undefined) {
-        setDebugCalibrationData(changes.debugCalibrationData.newValue);
-      }
-    };
-    chrome.storage.onChanged.addListener(listener);
-    return () => chrome.storage.onChanged.removeListener(listener);
-  }, []);
+    if (!hydrated) return;
+    chrome.runtime.sendMessage({ type: 'GET_EXPORT_STATUS' }, (response) => {
+      if (chrome.runtime.lastError || !response?.ok || !response.isActive) return;
+      setIsExporting(true);
+      const elapsed = response.startedAt ? Date.now() - response.startedAt : 0;
+      const remaining = Math.max(5000, 120000 - elapsed);
+      exportTimeoutRef.current = setTimeout(() => {
+        exportTimeoutRef.current = null;
+        setIsExporting(false);
+        setMissingAgentsList([]);
+        setPendingBatchData([]);
+        addLog('Sheets', 'Попереднє очікування експорту завершено по таймауту. Перевірте таблицю.', 400);
+      }, remaining);
+    });
+  }, [hydrated]);
 
   useEffect(() => {
     if (activeTab === 'settings') {
@@ -272,7 +281,14 @@ export default function ExtensionPopup() {
   useEffect(() => {
     const handleMessages = (msg) => {
       if (msg?.action === 'EXPORT_COMPLETED') {
+        if (exportTimeoutRef.current) {
+          clearTimeout(exportTimeoutRef.current);
+          exportTimeoutRef.current = null;
+        }
         setIsExporting(false);
+        if (msg.error) {
+          addLog('Sheets', msg.error, 500);
+        }
       }
     };
     chrome.runtime.onMessage.addListener(handleMessages);
@@ -290,6 +306,11 @@ export default function ExtensionPopup() {
     const listener = (msg) => {
       if (msg?.type === 'COLLECT_PROGRESS' || msg?.type === 'LOG') {
         addLog(msg.site || 'Система', msg.message, msg.code);
+      }
+      if (msg?.type === 'FETCH_PROGRESS') {
+        const { site, totalBytes = 0 } = msg;
+        if (site === 'site1') setFetchBytes((prev) => ({ ...prev, site1: Math.max(prev.site1, totalBytes) }));
+        if (site === 'site2') setFetchBytes((prev) => ({ ...prev, site2: Math.max(prev.site2, totalBytes) }));
       }
     };
     chrome.runtime.onMessage.addListener(listener);
@@ -377,6 +398,7 @@ export default function ExtensionPopup() {
 
   const handleFetchData = async () => {
     addLog('Система', 'Початок збору даних...', null);
+    setFetchBytes({ site1: 0, site2: 0 });
     setIsLoadingFetch(true);
     setCanInsert(false);
 
@@ -390,6 +412,7 @@ export default function ExtensionPopup() {
       setIsLoadingFetch(false);
       return;
     }
+    setActiveFetchSite(isSite1 ? 'site1' : 'site2');
 
     const storedTagId = await new Promise((resolve) => {
       chrome.storage.local.get(['trackensureTagId'], (data) => resolve(data.trackensureTagId));
@@ -431,6 +454,7 @@ export default function ExtensionPopup() {
         },
       },
       (response) => {
+        setActiveFetchSite(null);
         if (chrome.runtime.lastError) {
           addLog('Система', chrome.runtime.lastError.message, 500);
           setStatus({ site1: false, site2: false, merge: null });
@@ -502,29 +526,48 @@ export default function ExtensionPopup() {
   };
 
   const handleConfirmMissing = () => {
-    console.log('[КРОК 3 - ПОПАП] Стейт при натисканні "Так":', pendingBatchData);
     if (!pendingBatchData || !pendingBatchData.length) {
-      addLog('Система', '[ДЕБАГ] Стейт pendingBatchData ПОРОЖНІЙ при натисканні!', 400);
+      addLog('Система', 'Дані для запису відсутні', 400);
       return;
     }
-    addLog('Дебаг Payload', JSON.stringify(pendingBatchData[0]), null);
-    console.log('Confirming write with batchUpdateData length:', pendingBatchData.length);
 
     setIsExporting(true);
+
+    const closeModal = () => {
+      setMissingAgentsList([]);
+      setPendingBatchData([]);
+    };
+
+    let settled = false;
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      setIsExporting(false);
+      closeModal();
+      addLog('Sheets', 'Перевищено час очікування від бекграунду (2 хв). Перевірте таблицю.', 500);
+    }, 120000);
+
     chrome.runtime.sendMessage({
       type: 'EXECUTE_SHEETS_BATCH',
       action: 'EXECUTE_SHEETS_BATCH',
       payload: {
         sheetId,
         token: sheetToken,
-        batchUpdateData: pendingBatchData
+        batchUpdateData: pendingBatchData,
       }
     }, (response) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
       setIsExporting(false);
-      if (response && response.ok) {
-        addLog('Sheets', 'Експорт частково завершено (агентів пропущено)!', 200);
-        setMissingAgentsList([]);
-        setPendingBatchData([]);
+      closeModal();
+
+      if (chrome.runtime.lastError) {
+        addLog('Sheets', chrome.runtime.lastError.message || 'Помилка зв\'язку з бекграундом', 500);
+        return;
+      }
+      if (response?.ok) {
+        addLog('Sheets', 'Експорт завершено (деякі агенти пропущені)', 200);
       } else {
         addLog('Sheets', response?.error || 'Помилка виконання', 500);
       }
@@ -611,6 +654,10 @@ export default function ExtensionPopup() {
                 missingAgents={missingAgentsList}
                 onConfirmMissing={handleConfirmMissing}
                 onCancelMissing={handleCancelMissing}
+                isFetchingTrackensure={isLoadingFetch && activeFetchSite === 'site1'}
+                isFetchingOrchard={isLoadingFetch && activeFetchSite === 'site2'}
+                site1FetchBytes={fetchBytes.site1}
+                site2FetchBytes={fetchBytes.site2}
               />
             )}
             {appMode === 'shift_statistic' && <ShiftStatisticMode />}

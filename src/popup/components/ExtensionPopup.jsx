@@ -50,6 +50,7 @@ export default function ExtensionPopup() {
   const [debugCalibrationData, setDebugCalibrationData] = useState(null);
   const [appMode, setAppMode] = useState('default');
   const [isAuth, setIsAuth] = useState(true);
+  const [isInitializing, setIsInitializing] = useState(true);
   const [fetchBytes, setFetchBytes] = useState({ site1: 0, site2: 0 });
   const [activeFetchSite, setActiveFetchSite] = useState(null);
   const exportTimeoutRef = useRef(null);
@@ -90,13 +91,13 @@ export default function ExtensionPopup() {
         'trackensureOffset',
         'orchardOffset',
         'debugCalibrationData',
+        'appMode',
       ],
       (data) => {
         if (data?.fetchInProgress) setIsLoadingFetch(true);
         setDateFrom(data?.popupDateFrom || '');
         setDateTo(data?.popupDateTo || '');
         if (data?.popupTimezone) setTimezone(data.popupTimezone);
-        if (data?.appMode) setAppMode(data.appMode);
         setStatus(data?.popupStatus ?? { site1: null, site2: null, merge: null });
         setSettings({ ...settings, ...(data?.popupSettings || {}) });
         setLogs(Array.isArray(data?.popupLogs) && data.popupLogs.length > 0 ? data.popupLogs : logs);
@@ -119,7 +120,9 @@ export default function ExtensionPopup() {
         if (data?.orchardOffset !== undefined) setOrchardOffset(Number(data.orchardOffset));
         else setOrchardOffset(2);
         if (data?.debugCalibrationData) setDebugCalibrationData(data.debugCalibrationData);
+        if (data?.appMode) setAppMode(data.appMode);
         setHydrated(true);
+        setIsInitializing(false);
       }
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -597,6 +600,10 @@ export default function ExtensionPopup() {
     chrome.storage.local.set({ popupLogs: [] });
     showSaved('Логи очищено');
   };
+
+  if (isInitializing) {
+    return <div className="w-[400px] h-[530px] bg-white" />;
+  }
 
   return (
     <div className="w-[400px] h-[530px] bg-white flex flex-col font-sans text-gray-800 shadow-xl overflow-hidden">

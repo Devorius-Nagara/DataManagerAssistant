@@ -1,7 +1,7 @@
 import { logToPopup, readFromStorage, setFetchFlag, convertDateTimeToMs, DATA_KEYS } from './shared.js';
-import { fetchTags, fetchTrackensureUsers, fetchAllTasks, STORAGE_USERS_KEY } from './api/trackensure.js';
+import { fetchTags, fetchTrackensureUsers, fetchAllTasks, fetchDisputeTasks, fetchComplainsTasks, fetchTaskHistories, STORAGE_USERS_KEY } from './api/trackensure.js';
 import { fetchOrchardTeams, fetchAllOrchardShifts, ensureOrchardToken, fetchAgentWorkHours } from './api/orchard.js';
-import { fetchSheetValuesBg, executeSheetsBatch } from './api/sheets.js';
+import { fetchSheetValuesBg, executeSheetsBatch, exportCustomReport } from './api/sheets.js';
 import { buildSheetMatrix, mapMatrixToUpdatesBg, inferMonthYear, aggregateData, aggregateTrackensure } from './modes/defaultModeBuilder.js';
 
 let site1Cache = [];
@@ -170,6 +170,77 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .then((resp) => sendResponse(resp))
         .catch((err) => sendResponse({ ok: false, error: err?.message || 'Помилка зведення' }));
       return true;
+    case 'FETCH_CUSTOM_REPORT': {
+      (async () => {
+        try {
+          const { reportType = 'dispute_tasks', dateFrom, dateTo, tagId, apiOffset = 2 } = message.payload || {};
+          if (!dateFrom || !dateTo) {
+            sendResponse({ ok: false, error: 'Відсутні дати' });
+            return;
+          }
+          const dateFromMs = convertDateTimeToMs(dateFrom, apiOffset);
+          const dateToMs = convertDateTimeToMs(dateTo, apiOffset);
+
+          let tasks;
+          if (reportType === 'complains') {
+            logToPopup('Custom', 'Збір Complains задач...', null);
+            tasks = await fetchComplainsTasks({ dateFromMs, dateToMs, teamId: tagId });
+
+            if (tasks.length) {
+              logToPopup('Custom', `Зібрано ${tasks.length} задач. Завантаження коментарів...`, null);
+              const taskIds = tasks.map((t) => t.taskId).filter(Boolean);
+              const historiesMap = await fetchTaskHistories(taskIds);
+              tasks = tasks.map((t) => ({ ...t, _comments: historiesMap[t.taskId] || [] }));
+            }
+          } else {
+            logToPopup('Custom', 'Збір Dispute задач...', null);
+            tasks = await fetchDisputeTasks({ dateFromMs, dateToMs, teamId: tagId });
+          }
+
+          await chrome.storage.local.set({ customReportData: tasks, customReportType: reportType });
+
+          logToPopup('Custom', `Зібрано ${tasks.length} задач`, 200);
+          sendResponse({ ok: true, total: tasks.length });
+        } catch (err) {
+          console.error('[FETCH_CUSTOM_REPORT] помилка:', err);
+          sendResponse({ ok: false, error: err?.message || 'Помилка зчитування' });
+        }
+      })();
+      return true;
+    }
+    case 'EXPORT_CUSTOM_REPORT': {
+      (async () => {
+        try {
+          const { sheetId, token, trackensureOffset = 2, dateRangeStr } = message.payload || {};
+          if (!sheetId || !token) {
+            sendResponse({ ok: false, error: "Відсутні обов'язкові параметри" });
+            return;
+          }
+          const stored = await chrome.storage.local.get(['customReportData', 'customReportType']);
+          const tasks = stored.customReportData;
+          const reportType = stored.customReportType || 'dispute_tasks';
+          if (!Array.isArray(tasks) || !tasks.length) {
+            sendResponse({ ok: false, error: 'Немає зчитаних даних. Спочатку запустіть зчитування.' });
+            return;
+          }
+
+          const dataMatrix = reportType === 'complains'
+            ? buildComplainsMatrix(tasks, trackensureOffset)
+            : buildDisputeMatrix(tasks, trackensureOffset);
+          const fallbackName = reportType === 'complains' ? 'Complains Report' : 'Dispute Report';
+
+          logToPopup('Custom', `Запис ${tasks.length} рядків у Sheets...`, null);
+          await exportCustomReport(token, sheetId, dataMatrix, dateRangeStr || fallbackName);
+
+          logToPopup('Custom', `Звіт записано: ${tasks.length} рядків`, 200);
+          sendResponse({ ok: true, rowCount: tasks.length });
+        } catch (err) {
+          console.error('[EXPORT_CUSTOM_REPORT] помилка:', err);
+          sendResponse({ ok: false, error: err?.message || 'Помилка експорту' });
+        }
+      })();
+      return true;
+    }
     default:
       return false;
   }
@@ -338,6 +409,77 @@ function requestParse(tabId, selector, days) {
       resolve(response.data || []);
     });
   });
+}
+
+function toHHMMSS(seconds) {
+  if (seconds == null || isNaN(Number(seconds))) return '';
+  const s = Math.abs(Math.round(Number(seconds)));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+}
+
+function sanitizeCell(value) {
+  if (value == null) return '';
+  const str = String(value);
+  return /^[=+\-@]/.test(str) ? `'${str}` : str;
+}
+
+function formatDateOffset(ms, offset) {
+  if (!ms) return '';
+  const d = new Date(Number(ms) + Number(offset) * 3600000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function buildBaseRow(task, trackensureOffset) {
+  return [
+    sanitizeCell(task?.taskId),
+    sanitizeCell(formatDateOffset(task?.createDate, trackensureOffset)),
+    sanitizeCell(task?.status),
+    sanitizeCell(task?.requestType),
+    sanitizeCell(task?.eldType),
+    sanitizeCell(task?.organizationDTO?.name),
+    sanitizeCell(task?.driverProfileDTO?.fullName),
+    sanitizeCell(toHHMMSS(task?.inProgressSpendTimeSec)),
+    sanitizeCell(toHHMMSS(task?.totalNoChargeTimeSec)),
+    sanitizeCell(toHHMMSS(task?.totalSpentTimeSec)),
+    sanitizeCell(task?.ownerDTO?.fullName),
+  ];
+}
+
+function buildDisputeMatrix(tasks, trackensureOffset = 2) {
+  const headers = [
+    'taskId', 'createDate', 'status', 'requestType', 'eldType',
+    'Organization', 'Driver', 'inProgressTime', 'noChargeTime', 'totalSpentTime',
+    'Owner', 'disputeReason',
+  ];
+  const rows = tasks.map((task) => [
+    ...buildBaseRow(task, trackensureOffset),
+    sanitizeCell(task?.supportTaskDisputeDTO?.disputeReason),
+  ]);
+  return [headers, ...rows];
+}
+
+function buildComplainsMatrix(tasks, trackensureOffset = 2) {
+  // Find the maximum comment count across all tasks to build dynamic column headers
+  const maxComments = tasks.reduce((max, t) => Math.max(max, (t._comments || []).length), 0);
+  const commentHeaders = Array.from({ length: maxComments }, (_, i) => `comment ${i + 1}`);
+
+  const headers = [
+    'taskId', 'createDate', 'status', 'requestType', 'eldType',
+    'Organization', 'Driver', 'inProgressTime', 'noChargeTime', 'totalSpentTime',
+    'Owner', 'Task Details', ...commentHeaders,
+  ];
+
+  const rows = tasks.map((task) => {
+    const comments = task._comments || [];
+    const commentCells = Array.from({ length: maxComments }, (_, i) => sanitizeCell(comments[i] ?? ''));
+    return [...buildBaseRow(task, trackensureOffset), sanitizeCell(task?.taskDetails), ...commentCells];
+  });
+
+  return [headers, ...rows];
 }
 
 function trySendAggregateReport() {

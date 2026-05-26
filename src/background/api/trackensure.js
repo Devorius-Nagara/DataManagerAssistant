@@ -5,6 +5,7 @@ const TAGS_URL = `${TRACK_BASE}/tag?actionName=getPermittedTagListForUser`;
 const TASKS_FIRST_URL = `${TRACK_BASE}/supportTask?actionName=getSupportTaskListLTByFilterAndPageNumber`;
 const TASKS_NEXT_URL = `${TRACK_BASE}/supportTask?actionName=getSupportTaskListByFilterLT`;
 const TRACK_USERS_URL = `${TRACK_BASE}/fleet/user?actionName=getACLUserListLTByOrgId`;
+const TASK_HISTORY_URL = `${TRACK_BASE}/supportTaskHistory?actionName=getSupportTaskHistoryListByTaskId`;
 export const STORAGE_USERS_KEY = 'trackensureUsersCache';
 export const CLIENT_REQUEST_TYPES = [
   'mobile_assistance',
@@ -198,6 +199,148 @@ async function fetchTasksPaginated({ dateFrom, dateTo, tagId, taskTeamLeaderId, 
     isFirstPage = false;
   }
   return all;
+}
+
+export async function fetchDisputeTasks({ dateFromMs, dateToMs, teamId }) {
+  const dateFrom = dateFromMs || Date.now();
+  const dateTo = dateToMs || Date.now();
+  const all = [];
+  let beforeTaskId = null;
+  let isFirstPage = true;
+  let totalBytes = 0;
+
+  while (true) {
+    const url = isFirstPage ? TASKS_FIRST_URL : TASKS_NEXT_URL;
+    const payload = isFirstPage
+      ? {
+          dateFrom,
+          dateTo,
+          tagIdSet: teamId ? [teamId] : [],
+          limitOnPage: 500,
+          showDisputeRequired: true,
+          pageNumber: 1,
+        }
+      : {
+          dateFrom,
+          dateTo,
+          tagIdSet: teamId ? [teamId] : [],
+          limitOnPage: 500,
+          showDisputeRequired: true,
+          beforeTaskId,
+          callerMgrUserId: null,
+          driverIdByDriverName: null,
+          taskOwnerId: null,
+          createdBy: null,
+        };
+
+    const { data, status, textBody } = await fetchJson(url, payload);
+    const tasks = normalizeTasks(data);
+
+    if (!tasks.length) break;
+
+    all.push(...tasks);
+    totalBytes += textBody.length;
+    chrome.runtime.sendMessage({ type: 'FETCH_PROGRESS', site: 'site1', count: all.length, totalBytes });
+
+    beforeTaskId = tasks[tasks.length - 1]?.taskId;
+    if (!beforeTaskId) break;
+    isFirstPage = false;
+  }
+
+  logToPopup('Custom', `Зібрано ${all.length} dispute задач`, 200);
+  return all;
+}
+
+export async function fetchComplainsTasks({ dateFromMs, dateToMs, teamId }) {
+  const dateFrom = dateFromMs || Date.now();
+  const dateTo = dateToMs || Date.now();
+  const all = [];
+  let beforeTaskId = null;
+  let isFirstPage = true;
+  let totalBytes = 0;
+
+  while (true) {
+    const url = isFirstPage ? TASKS_FIRST_URL : TASKS_NEXT_URL;
+    const payload = isFirstPage
+      ? {
+          dateFrom,
+          dateTo,
+          tagIdSet: teamId ? [teamId] : [],
+          limitOnPage: 500,
+          status: 'completed',
+          includeRequestTypeList: ['complain'],
+          pageNumber: 1,
+        }
+      : {
+          dateFrom,
+          dateTo,
+          tagIdSet: teamId ? [teamId] : [],
+          limitOnPage: 500,
+          status: 'completed',
+          includeRequestTypeList: ['complain'],
+          beforeTaskId,
+          callerMgrUserId: null,
+          driverIdByDriverName: null,
+          taskOwnerId: null,
+          createdBy: null,
+        };
+
+    const { data, status, textBody } = await fetchJson(url, payload);
+    const tasks = normalizeTasks(data);
+
+    if (!tasks.length) break;
+
+    all.push(...tasks);
+    totalBytes += textBody.length;
+    chrome.runtime.sendMessage({ type: 'FETCH_PROGRESS', site: 'site1', count: all.length, totalBytes });
+
+    beforeTaskId = tasks[tasks.length - 1]?.taskId;
+    if (!beforeTaskId) break;
+    isFirstPage = false;
+  }
+
+  logToPopup('Custom', `Зібрано ${all.length} complains задач`, 200);
+  return all;
+}
+
+// Fetches filtered comment history for a list of taskIds in batches of 10
+// to avoid rate-limiting (429) from the TrackEnsure API.
+// Returns: { [taskId]: string[] } — only non-empty comments per task.
+export async function fetchTaskHistories(taskIds) {
+  const BATCH_SIZE = 10;
+  const result = {};
+  const ids = Array.from(taskIds).filter(Boolean);
+
+  for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+    const batch = ids.slice(i, i + BATCH_SIZE);
+
+    await Promise.all(
+      batch.map(async (taskId) => {
+        try {
+          const res = await fetch(`${TASK_HISTORY_URL}&taskId=${taskId}`, {
+            method: 'GET',
+            credentials: 'include',
+          });
+          if (!res.ok) {
+            result[taskId] = [];
+            return;
+          }
+          const text = await res.text();
+          const data = safeParse(text);
+          const items = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : []);
+          result[taskId] = items
+            .filter((h) => h?.comment && String(h.comment).trim())
+            .map((h) => String(h.comment).trim());
+        } catch {
+          result[taskId] = [];
+        }
+      })
+    );
+
+    logToPopup('Custom', `Коментарі: ${Math.min(i + BATCH_SIZE, ids.length)} / ${ids.length} тасків`, null);
+  }
+
+  return result;
 }
 
 async function fetchJson(url, body) {

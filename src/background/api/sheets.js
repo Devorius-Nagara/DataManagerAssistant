@@ -70,6 +70,88 @@ export async function executeSheetsBatch(payload = {}) {
   }
 }
 
+export async function exportWorkloadReport(token, spreadsheetId, dataMatrix, sheetTitle) {
+  const baseUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}`;
+  let title = sheetTitle || `Workload ${new Date().toLocaleDateString('uk-UA')}`;
+
+  const tryAddSheet = async (t) => fetch(`${baseUrl}:batchUpdate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ requests: [{ addSheet: { properties: { title: t, index: 0 } } }] }),
+  });
+
+  let numericSheetId = null;
+  let createRes = await tryAddSheet(title);
+  if (!createRes.ok) {
+    const errText = await createRes.text();
+    let errMsg = '';
+    try { errMsg = JSON.parse(errText)?.error?.message || ''; } catch { /* ignore */ }
+    if (createRes.status === 400 && errMsg.toLowerCase().includes('already exists')) {
+      title = `${title} (${Date.now()})`;
+      const retry = await tryAddSheet(title);
+      if (!retry.ok) { const t2 = await retry.text(); throw new Error(`Не вдалося створити аркуш: ${t2.slice(0, 200)}`); }
+      numericSheetId = (await retry.json())?.replies?.[0]?.addSheet?.properties?.sheetId ?? null;
+    } else {
+      throw new Error(`Не вдалося створити аркуш: ${errMsg || errText.slice(0, 200)}`);
+    }
+  } else {
+    numericSheetId = (await createRes.json())?.replies?.[0]?.addSheet?.properties?.sheetId ?? null;
+  }
+
+  // Write data
+  const numCols = dataMatrix[0]?.length || 1;
+  const endCol  = String.fromCharCode(64 + numCols);
+  const numRows = dataMatrix.length;
+  const safeTitle = title.replace(/'/g, "''");
+  const writeRes = await fetch(`${baseUrl}/values:batchUpdate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: [{ range: `'${safeTitle}'!A1:${endCol}${numRows}`, values: dataMatrix }] }),
+  });
+  if (!writeRes.ok) {
+    const e = await writeRes.text();
+    let msg = e.slice(0, 200);
+    try { msg = JSON.parse(e)?.error?.message || msg; } catch { /* ignore */ }
+    throw new Error(`Не вдалося записати дані: ${msg}`);
+  }
+
+  // Format (non-fatal)
+  // Columns: 0=Date, 1=Shift, 2=Tasks, 3=TLs, 4=Agents, 5=Absent, 6=Extra, 7=Peak Hour, 8=Peak Wait
+  if (numericSheetId != null) {
+    try {
+      await fetch(`${baseUrl}:batchUpdate`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          requests: [
+            {
+              repeatCell: {
+                range: { sheetId: numericSheetId },
+                cell: { userEnteredFormat: { wrapStrategy: 'WRAP', verticalAlignment: 'TOP' } },
+                fields: 'userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment',
+              },
+            },
+            {
+              repeatCell: {
+                range: { sheetId: numericSheetId, startRowIndex: 0, endRowIndex: 1 },
+                cell: { userEnteredFormat: { backgroundColor: { red: 0.85, green: 0.93, blue: 1.0 } } },
+                fields: 'userEnteredFormat.backgroundColor',
+              },
+            },
+            { updateDimensionProperties: { range: { sheetId: numericSheetId, dimension: 'COLUMNS', startIndex: 0, endIndex: 1 }, properties: { pixelSize: 95 },  fields: 'pixelSize' } },
+            { updateDimensionProperties: { range: { sheetId: numericSheetId, dimension: 'COLUMNS', startIndex: 1, endIndex: 2 }, properties: { pixelSize: 115 }, fields: 'pixelSize' } },
+            { updateDimensionProperties: { range: { sheetId: numericSheetId, dimension: 'COLUMNS', startIndex: 2, endIndex: 7 }, properties: { pixelSize: 60 },  fields: 'pixelSize' } },
+            { updateDimensionProperties: { range: { sheetId: numericSheetId, dimension: 'COLUMNS', startIndex: 7, endIndex: 8 }, properties: { pixelSize: 190 }, fields: 'pixelSize' } },
+            { updateDimensionProperties: { range: { sheetId: numericSheetId, dimension: 'COLUMNS', startIndex: 8, endIndex: 9 }, properties: { pixelSize: 100 }, fields: 'pixelSize' } },
+          ],
+        }),
+      });
+    } catch { /* formatting errors are non-fatal */ }
+  }
+
+  return { ok: true };
+}
+
 export async function exportCustomReport(token, spreadsheetId, dataMatrix, dateRangeStr) {
   const baseUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}`;
   let sheetTitle = dateRangeStr || `Dispute ${new Date().toLocaleDateString('uk-UA')}`;

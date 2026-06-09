@@ -1,13 +1,16 @@
 import { logToPopup, readFromStorage, setFetchFlag, convertDateTimeToMs, DATA_KEYS } from './shared.js';
-import { fetchTags, fetchTrackensureUsers, fetchAllTasks, fetchDisputeTasks, fetchComplainsTasks, fetchTaskHistories, STORAGE_USERS_KEY } from './api/trackensure.js';
-import { fetchOrchardTeams, fetchAllOrchardShifts, ensureOrchardToken, fetchAgentWorkHours } from './api/orchard.js';
-import { fetchSheetValuesBg, executeSheetsBatch, exportCustomReport } from './api/sheets.js';
+import { fetchTags, fetchTrackensureUsers, fetchAllTasks, fetchDisputeTasks, fetchComplainsTasks, fetchTaskHistories, fetchWorkloadTasks, fetchQueues, fetchCallHistory, STORAGE_USERS_KEY } from './api/trackensure.js';
+import { fetchOrchardTeams, fetchAllOrchardShifts, ensureOrchardToken, fetchAgentWorkHours, fetchOrchardDepartments, fetchOrchardTeamsByDept, fetchWorkloadSchedules, fetchWorkloadActualHours } from './api/orchard.js';
+import { fetchSheetValuesBg, executeSheetsBatch, exportCustomReport, exportWorkloadReport } from './api/sheets.js';
 import { buildSheetMatrix, mapMatrixToUpdatesBg, inferMonthYear, aggregateData, aggregateTrackensure } from './modes/defaultModeBuilder.js';
+import { buildWorkloadStats, buildWorkloadMatrix } from './modes/workloadModeBuilder.js';
 
 let site1Cache = [];
 let site2Cache = [];
 let aggregationOptions = { includeCancel5: true, includeShift20: true };
 let debugSaved = false;
+let workloadStopRequested = false;
+const workloadGetStop = () => workloadStopRequested;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const type = message?.type || message?.action;
@@ -240,6 +243,152 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
       })();
       return true;
+    }
+    case 'GET_WORKLOAD_DEPARTMENTS':
+      fetchOrchardDepartments()
+        .then((departments) => sendResponse({ ok: true, departments }))
+        .catch((err) => sendResponse({ ok: false, error: err?.message || 'Помилка департаментів' }));
+      return true;
+    case 'GET_WORKLOAD_TEAMS': {
+      const { departmentId } = message.payload || {};
+      fetchOrchardTeamsByDept(departmentId)
+        .then((teams) => sendResponse({ ok: true, teams }))
+        .catch((err) => sendResponse({ ok: false, error: err?.message || 'Помилка команд' }));
+      return true;
+    }
+    case 'GET_WORKLOAD_QUEUES':
+      fetchQueues()
+        .then((queues) => sendResponse({ ok: true, queues }))
+        .catch((err) => sendResponse({ ok: false, error: err?.message || 'Помилка ліній' }));
+      return true;
+    case 'FETCH_WORKLOAD_DATA': {
+      (async () => {
+        try {
+          workloadStopRequested = false;
+          const { dateFrom, dateTo, shiftTagIds } = message.payload || {};
+          if (!dateFrom || !dateTo) { sendResponse({ ok: false, error: 'Відсутні дати' }); return; }
+
+          const apiOffset    = Number((await readFromStorage('apiRangeOffset')) ?? 2);
+          const orchardTzOff = Number((await readFromStorage('orchardOffset'))   ?? 2);
+          const dateFromMs   = convertDateTimeToMs(dateFrom, apiOffset);
+          const dateToMs     = convertDateTimeToMs(dateTo.includes('T') ? dateTo : `${dateTo}T23:59`, apiOffset);
+
+          const teamIds      = (await readFromStorage('wlTeamIds'))      || [];
+          const queueIds     = (await readFromStorage('wlQueueIds'))     || [];
+          const storedTeams  = (await readFromStorage('wlTeams'))        || [];
+          const departmentId = Number((await readFromStorage('wlDepartmentId')) ?? 2);
+          const analyzeCalls = (await readFromStorage('wlAnalyzeCalls')) !== false;
+
+          // ── Phase 1: TrackEnsure shift tasks ─────────────────────────────
+          chrome.runtime.sendMessage({ type: 'WORKLOAD_PHASE', phase: 'te_start' });
+          logToPopup('Workload', 'Збір TE shift тасків...', null);
+          let tasks;
+          try {
+            tasks = await fetchWorkloadTasks({ dateFromMs, dateToMs, shiftTagIds, getShouldStop: workloadGetStop });
+          } catch (err) {
+            chrome.runtime.sendMessage({ type: 'WORKLOAD_PHASE', phase: 'te_error' });
+            throw err;
+          }
+          if (workloadStopRequested) { sendResponse({ ok: false, error: 'Зупинено' }); return; }
+          chrome.runtime.sendMessage({ type: 'WORKLOAD_PHASE', phase: 'te_done' });
+
+          // ── Phase 2: Call history ─────────────────────────────────────────
+          chrome.runtime.sendMessage({ type: 'WORKLOAD_PHASE', phase: 'calls_start' });
+          logToPopup('Workload', 'Збір дзвінків...', null);
+          let calls = [];
+          try {
+            calls = await fetchCallHistory({ dateFromMs, dateToMs, queueIds, getShouldStop: workloadGetStop, analyzeCalls });
+          } catch (err) {
+            chrome.runtime.sendMessage({ type: 'WORKLOAD_PHASE', phase: 'calls_error' });
+            logToPopup('Workload', `Помилка дзвінків: ${err?.message}`, 500);
+            // non-fatal — continue without calls
+          }
+          if (workloadStopRequested) { sendResponse({ ok: false, error: 'Зупинено' }); return; }
+          chrome.runtime.sendMessage({ type: 'WORKLOAD_PHASE', phase: 'calls_done' });
+
+          // ── Phase 3: Orchard schedules + work hours ───────────────────────
+          let schedules = [];
+          let workHours = {};
+          if (Array.isArray(teamIds) && teamIds.length) {
+            chrome.runtime.sendMessage({ type: 'WORKLOAD_PHASE', phase: 'orchard_start' });
+            logToPopup('Workload', `Збір Orchard розкладів для ${teamIds.length} команд...`, null);
+            try {
+              schedules = await fetchWorkloadSchedules({ dateFromMs, dateToMs, teamIds, departmentId, getShouldStop: workloadGetStop });
+            } catch (err) {
+              chrome.runtime.sendMessage({ type: 'WORKLOAD_PHASE', phase: 'orchard_error' });
+              throw err;
+            }
+            if (workloadStopRequested) { sendResponse({ ok: false, error: 'Зупинено' }); return; }
+
+            const agentIds = new Set(
+              schedules.map(s => s.agentId ?? s.agentDTO?.userId ?? s.agentDTO?.agentId).filter(Boolean)
+            );
+            logToPopup('Workload', `Збір годин для ${agentIds.size} агентів...`, null);
+            try {
+              workHours = await fetchWorkloadActualHours({ dateFromMs, dateToMs, agentIds, getShouldStop: workloadGetStop });
+            } catch (err) {
+              chrome.runtime.sendMessage({ type: 'WORKLOAD_PHASE', phase: 'orchard_error' });
+              throw err;
+            }
+            if (workloadStopRequested) { sendResponse({ ok: false, error: 'Зупинено' }); return; }
+            chrome.runtime.sendMessage({ type: 'WORKLOAD_PHASE', phase: 'orchard_done' });
+          } else {
+            logToPopup('Workload', 'Команди Orchard не обрані — пропуск Orchard', null);
+          }
+
+          // ── Calculate stats ───────────────────────────────────────────────
+          const { rows } = buildWorkloadStats({
+            rawTasks: tasks, rawSchedules: schedules, rawWorkHours: workHours,
+            rawCalls: calls, teams: storedTeams, tzOffset: orchardTzOff,
+          });
+
+          await chrome.storage.local.set({
+            wlRawTasks: tasks, wlRawSchedules: schedules,
+            wlRawWorkHours: workHours, wlRawCalls: calls, wlStats: rows,
+            workloadDebugRows: rows,
+          });
+          logToPopup('Workload', `Готово: ${tasks.length} тасків, ${calls.length} дзвінків, ${schedules.length} змін`, 200);
+          sendResponse({ ok: true, total: tasks.length, stats: rows });
+        } catch (err) {
+          console.error('[FETCH_WORKLOAD_DATA] помилка:', err);
+          sendResponse({ ok: false, error: err?.message || 'Помилка зчитування' });
+        }
+      })();
+      return true;
+    }
+    case 'EXPORT_WORKLOAD_REPORT': {
+      (async () => {
+        try {
+          const { sheetId, token, sheetTitle } = message.payload || {};
+          if (!sheetId || !token) { sendResponse({ ok: false, error: "Відсутні обов'язкові параметри" }); return; }
+          const stored = await chrome.storage.local.get(['wlStats']);
+          const rows = stored.wlStats;
+          if (!Array.isArray(rows) || !rows.length) {
+            sendResponse({ ok: false, error: 'Немає зчитаних даних. Спочатку запустіть зчитування.' });
+            return;
+          }
+          const matrix = buildWorkloadMatrix(rows);
+          logToPopup('Workload', `Запис ${rows.length} рядків у Sheets...`, null);
+          await exportWorkloadReport(token, sheetId, matrix, sheetTitle);
+          logToPopup('Workload', 'Workload звіт записано', 200);
+          sendResponse({ ok: true, rowCount: rows.length });
+        } catch (err) {
+          console.error('[EXPORT_WORKLOAD_REPORT] помилка:', err);
+          sendResponse({ ok: false, error: err?.message || 'Помилка експорту' });
+        }
+      })();
+      return true;
+    }
+    case 'STOP_WORKLOAD_FETCH': {
+      workloadStopRequested = true;
+      logToPopup('Workload', 'Зупинено користувачем', null);
+      sendResponse({ ok: true });
+      return false;
+    }
+    case 'CLEAR_WORKLOAD_DATA': {
+      chrome.storage.local.remove(['wlRawTasks', 'wlRawSchedules', 'wlRawWorkHours', 'wlRawCalls', 'wlStats']);
+      sendResponse({ ok: true });
+      return false;
     }
     default:
       return false;

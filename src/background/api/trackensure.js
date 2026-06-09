@@ -6,6 +6,8 @@ const TASKS_FIRST_URL = `${TRACK_BASE}/supportTask?actionName=getSupportTaskList
 const TASKS_NEXT_URL = `${TRACK_BASE}/supportTask?actionName=getSupportTaskListByFilterLT`;
 const TRACK_USERS_URL = `${TRACK_BASE}/fleet/user?actionName=getACLUserListLTByOrgId`;
 const TASK_HISTORY_URL = `${TRACK_BASE}/supportTaskHistory?actionName=getSupportTaskHistoryListByTaskId`;
+const QUEUES_URL = `${TRACK_BASE}/queue?actionName=getQueueListByFilter`;
+const CALLS_URL = `${TRACK_BASE}/call?actionName=getCallListByFilterAndPageNumber`;
 export const STORAGE_USERS_KEY = 'trackensureUsersCache';
 export const CLIENT_REQUEST_TYPES = [
   'mobile_assistance',
@@ -33,6 +35,19 @@ function normalizeTasks(response) {
   if (Array.isArray(response?.data)) return response.data;
   if (Array.isArray(response?.items)) return response.items;
   if (Array.isArray(response?.tasks)) return response.tasks;
+  return [];
+}
+
+function normalizeCalls(response) {
+  if (Array.isArray(response))                       return response;
+  if (Array.isArray(response?.callDTOList))          return response.callDTOList;
+  if (Array.isArray(response?.data?.callDTOList))    return response.data.callDTOList;
+  if (Array.isArray(response?.calls))                return response.calls;
+  if (Array.isArray(response?.data?.calls))          return response.data.calls;
+  if (Array.isArray(response?.data))                 return response.data;
+  if (Array.isArray(response?.items))                return response.items;
+  if (Array.isArray(response?.result))               return response.result;
+  if (Array.isArray(response?.callList))             return response.callList;
   return [];
 }
 
@@ -341,6 +356,137 @@ export async function fetchTaskHistories(taskIds) {
   }
 
   return result;
+}
+
+export async function fetchQueues() {
+  logToPopup('Workload', 'Завантаження ліній (Queues)...', null);
+  const { data, status } = await fetchJson(QUEUES_URL, {});
+  if (!Array.isArray(data)) {
+    logToPopup('Workload', 'Неочікувана відповідь Queues', status, {});
+    return [];
+  }
+  logToPopup('Workload', `Отримано ${data.length} ліній`, status);
+  return data;
+}
+
+export async function fetchCallHistory({ dateFromMs, dateToMs, queueIds, getShouldStop, analyzeCalls = true }) {
+  if (!analyzeCalls) return [];
+
+  const all = [];
+  let pageNumber = 1;
+  let paginationStartId = null;
+  let totalBytes = 0;
+  const LIMIT = 500;
+
+  console.log('[DEBUG WORKLOAD] Params for calls request:', {
+    dateFrom: dateFromMs, dateTo: dateToMs,
+    queueIdSet: (queueIds || []).map(Number), limitOnPage: LIMIT,
+  });
+
+  while (true) {
+    if (getShouldStop?.()) break;
+    const payload = {
+      dateFrom: dateFromMs,
+      dateTo: dateToMs,
+      type: 'incoming',
+      queueIdSet: (queueIds || []).map(Number),
+      statusStrSet: [],
+      pageNumber,
+      limitOnPage: LIMIT,
+      paginationStartId,
+    };
+
+    console.log(`[DEBUG WORKLOAD] Fetching calls page: ${pageNumber}, paginationStartId=${paginationStartId}, total so far=${all.length}`);
+    const { data: rawResponse, status, textBody } = await fetchJson(CALLS_URL, payload);
+    console.log(`[DEBUG WORKLOAD] API Response structure for page ${pageNumber}: ${JSON.stringify(rawResponse).substring(0, 300)}`);
+
+    const calls = normalizeCalls(rawResponse);
+    console.log(`[DEBUG WORKLOAD] Calls page ${pageNumber} returned: ${calls.length} calls (extracted via normalizeCalls)`);
+    if (!calls.length) break;
+
+    all.push(...calls);
+    totalBytes += textBody.length;
+    chrome.runtime.sendMessage({ type: 'FETCH_PROGRESS', site: 'wl_calls', count: all.length, totalBytes });
+    logToPopup('Workload', `Дзвінки: сторінка ${pageNumber}, всього ${all.length}`, status || 200);
+
+    if (calls.length < LIMIT) break;
+    // paginationStartId is optional; pageNumber is always incremented
+    paginationStartId = calls[calls.length - 1]?.callId ?? calls[calls.length - 1]?.id ?? null;
+    pageNumber++;
+    console.log(`[DEBUG WORKLOAD] Calls next page: pageNumber=${pageNumber}, paginationStartId=${paginationStartId}`);
+  }
+
+  logToPopup('Workload', `Зібрано ${all.length} дзвінків`, 200);
+  return all;
+}
+
+export async function fetchWorkloadTasks({ dateFromMs, dateToMs, shiftTagIds, getShouldStop }) {
+  const includeRequestTypeList = [
+    'mobile_assistance', 'log_editing', 'special_request', 'web_assistance',
+    'out_of_range', 'fleet_editor_assistance', 'complain', 'transaction_check',
+    'transaction_fix', 'ifta_service', 'troubleshooting',
+  ];
+  const all = [];
+  let beforeTaskId = null;
+  let isFirstPage = true;
+  let totalBytes = 0;
+
+  const firstPageParams = {
+    showMyDepartmentTaskRequired: false,
+    dateFrom: dateFromMs,
+    dateTo: dateToMs,
+    limitOnPage: 500,
+    tagIdSet: shiftTagIds,
+    status: 'completed',
+    includeRequestTypeList,
+    pageNumber: 1,
+  };
+  console.log('[DEBUG WORKLOAD] Params for tasks request:', firstPageParams);
+
+  while (true) {
+    if (getShouldStop?.()) break;
+    const url = isFirstPage ? TASKS_FIRST_URL : TASKS_NEXT_URL;
+    const payload = isFirstPage
+      ? firstPageParams
+      : {
+          dateFrom: dateFromMs,
+          dateTo: dateToMs,
+          limitOnPage: 500,
+          tagIdSet: shiftTagIds,
+          status: 'completed',
+          includeRequestTypeList,
+          beforeTaskId,
+          callerMgrUserId: null,
+          driverIdByDriverName: null,
+          taskOwnerId: null,
+          createdBy: null,
+        };
+
+    console.log(`[DEBUG WORKLOAD] Fetching tasks page: ${isFirstPage ? 1 : 'next'}, beforeTaskId=${beforeTaskId}, total so far=${all.length}`);
+    const { data: rawResponse, status, textBody } = await fetchJson(url, payload);
+    console.log(`[DEBUG WORKLOAD] API Response structure for page ${isFirstPage ? 1 : 'next'}: ${JSON.stringify(rawResponse).substring(0, 300)}`);
+    const tasks = normalizeTasks(rawResponse);
+    console.log(`[DEBUG WORKLOAD] Tasks page returned: ${tasks.length} tasks (key used: ${
+      Array.isArray(rawResponse?.supportTaskDTOList) ? 'supportTaskDTOList' :
+      Array.isArray(rawResponse) ? 'direct array' :
+      Array.isArray(rawResponse?.data) ? 'data' :
+      Array.isArray(rawResponse?.items) ? 'items' :
+      Array.isArray(rawResponse?.tasks) ? 'tasks' : 'none — 0 results!'
+    })`);
+    if (!tasks.length) break;
+
+    all.push(...tasks);
+    totalBytes += textBody.length;
+    chrome.runtime.sendMessage({ type: 'FETCH_PROGRESS', site: 'wl_te', count: all.length, totalBytes });
+    logToPopup('Workload', `TE тасків: всього ${all.length}`, status || 200);
+
+    beforeTaskId = tasks[tasks.length - 1]?.taskId;
+    if (!beforeTaskId) break;
+    isFirstPage = false;
+  }
+
+  logToPopup('Workload', `Зібрано ${all.length} TE тасків`, 200);
+  return all;
 }
 
 async function fetchJson(url, body) {

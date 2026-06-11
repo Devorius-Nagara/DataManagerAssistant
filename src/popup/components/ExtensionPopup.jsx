@@ -5,10 +5,12 @@ import DefaultMode from './modes/DefaultMode.jsx';
 import ShiftStatisticMode from './modes/ShiftStatisticMode.jsx';
 import WorkloadMode from './modes/WorkloadMode.jsx';
 import CustomReportsMode from './modes/CustomReportsMode.jsx';
+import PmsMode from './modes/PmsMode.jsx';
 import DefaultSettings from './modes/DefaultSettings.jsx';
 import ShiftStatisticSettings from './modes/ShiftStatisticSettings.jsx';
 import WorkloadSettings from './modes/WorkloadSettings.jsx';
 import CustomReportsSettings from './modes/CustomReportsSettings.jsx';
+import PmsSettings from './modes/PmsSettings.jsx';
 import LogsTab from './LogsTab.jsx';
 
 export default function ExtensionPopup() {
@@ -53,6 +55,8 @@ export default function ExtensionPopup() {
   const [isInitializing, setIsInitializing] = useState(true);
   const [fetchBytes, setFetchBytes] = useState({ site1: 0, site2: 0 });
   const [activeFetchSite, setActiveFetchSite] = useState(null);
+  const [defaultFetchError, setDefaultFetchError] = useState('');
+  const [defaultNeedsTabs, setDefaultNeedsTabs] = useState(false);
   const exportTimeoutRef = useRef(null);
 
   const handleLogout = () => {
@@ -315,6 +319,14 @@ export default function ExtensionPopup() {
         if (site === 'site1') setFetchBytes((prev) => ({ ...prev, site1: Math.max(prev.site1, totalBytes) }));
         if (site === 'site2') setFetchBytes((prev) => ({ ...prev, site2: Math.max(prev.site2, totalBytes) }));
       }
+      if (msg?.type === 'DEFAULT_PHASE') {
+        if (msg.phase === 'te_start')      setActiveFetchSite('site1');
+        if (msg.phase === 'orchard_start') setActiveFetchSite('site2');
+        if (msg.phase === 'te_done')       setStatus((p) => ({ ...p, site1: true }));
+        if (msg.phase === 'te_error')      setStatus((p) => ({ ...p, site1: false }));
+        if (msg.phase === 'orchard_done')  setStatus((p) => ({ ...p, site2: true }));
+        if (msg.phase === 'orchard_error') setStatus((p) => ({ ...p, site2: false }));
+      }
     };
     chrome.runtime.onMessage.addListener(listener);
     return () => chrome.runtime.onMessage.removeListener(listener);
@@ -399,89 +411,62 @@ export default function ExtensionPopup() {
   const tagsLookupName = (id) => trackensureTags.find((t) => t.tagId === id)?.tagName;
   const teamsLookupName = (id) => orchardTeams.find((t) => t.teamId === id)?.teamName;
 
-  const handleFetchData = async () => {
+  const handleFetchData = () => {
     addLog('Система', 'Початок збору даних...', null);
     setFetchBytes({ site1: 0, site2: 0 });
     setIsLoadingFetch(true);
     setCanInsert(false);
+    setDefaultFetchError('');
+    setDefaultNeedsTabs(false);
+    setStatus({ site1: null, site2: null, merge: null });
 
-    const [activeTabInfo] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const activeUrl = activeTabInfo?.url || '';
-    const isSite1 = activeUrl.includes('trackensure.com');
-    const isSite2 = activeUrl.includes('orchard22.com');
-
-    if (!isSite1 && !isSite2) {
-      addLog('Система', 'Відкрийте підтримуваний сайт для збору', 400);
-      setIsLoadingFetch(false);
-      return;
-    }
-    setActiveFetchSite(isSite1 ? 'site1' : 'site2');
-
-    const storedTagId = await new Promise((resolve) => {
-      chrome.storage.local.get(['trackensureTagId'], (data) => resolve(data.trackensureTagId));
-    });
-    const storedTeamId = await new Promise((resolve) => {
-      chrome.storage.local.get(['orchardTeamId'], (data) => resolve(data.orchardTeamId));
-    });
-    const storedTLs = await new Promise((resolve) => {
-      chrome.storage.local.get(['selectedTrackensureTLs'], (data) => resolve(data.selectedTrackensureTLs || []));
-    });
-    const tagId = storedTagId || selectedTagId;
-    const teamId = storedTeamId || selectedTeamId;
-    const tlIds = storedTLs.length ? storedTLs : selectedTLs;
-    const dtFrom = dateFrom || undefined;
-    const dtTo = dateTo || undefined;
-
-    if (isSite1) {
-      setStatus((prev) => ({ ...prev, site1: null }));
-    }
-    if (isSite2) {
-      setStatus((prev) => ({ ...prev, site2: null }));
-    }
+    const tagId  = selectedTagId;
+    const teamId = selectedTeamId;
+    const tlIds  = selectedTLs;
 
     chrome.runtime.sendMessage(
       {
-        type: 'START_FETCH_CONTEXT',
+        type: 'FETCH_DEFAULT_DATA',
         payload: {
-          tagId,
-          teamId,
-          tlIds,
-          dateFrom: dtFrom,
-          dateTo: dtTo,
-          timezone,
+          tagId, teamId, tlIds,
+          dateFrom: dateFrom || undefined,
+          dateTo:   dateTo   || undefined,
+          apiRangeOffset, orchardOffset,
           includeCancel5: Boolean(includeCancel5),
           includeShift20: Boolean(includeShift20),
-          trackensureOffset,
-          apiRangeOffset,
-          orchardOffset,
         },
       },
       (response) => {
         setActiveFetchSite(null);
+        setIsLoadingFetch(false);
         if (chrome.runtime.lastError) {
-          addLog('Система', chrome.runtime.lastError.message, 500);
-          setStatus({ site1: false, site2: false, merge: null });
-          setIsLoadingFetch(false);
+          const msg = chrome.runtime.lastError.message || "Помилка зв'язку";
+          addLog('Система', msg, 500);
+          setDefaultFetchError(msg);
           return;
         }
         if (!response?.ok) {
-          addLog('Система', response?.error || 'Помилка збору', 500);
-          setStatus((prev) => ({
-            ...prev,
-            site1: response?.site1 ?? prev.site1,
-            site2: response?.site2 ?? prev.site2,
-          }));
-          setIsLoadingFetch(false);
+          const msg = response?.error || 'Помилка збору';
+          addLog('Система', msg, 500);
+          setDefaultFetchError(msg);
+          setDefaultNeedsTabs(Boolean(response?.needsTabs));
           return;
         }
-        const site = response.site;
-        const total = response.total || 0;
-        if (site === 'site1') setStatus((prev) => ({ ...prev, site1: true }));
-        if (site === 'site2') setStatus((prev) => ({ ...prev, site2: true }));
-        addLog(site === 'site1' ? 'Сайт 1' : 'Сайт 2', `Успішно зібрано ${total} записів`, 200);
-        setIsLoadingFetch(false);
+        addLog('Система', `Готово: TE ${response.site1Total} / Orchard ${response.site2Total}`, 200);
       }
     );
+  };
+
+  const handleStopDefault = () => {
+    chrome.runtime.sendMessage({ type: 'STOP_DEFAULT_FETCH' });
+    setIsLoadingFetch(false);
+    setActiveFetchSite(null);
+    setStatus((p) => ({
+      site1: p.site1 === null ? false : p.site1,
+      site2: p.site2 === null ? false : p.site2,
+      merge: null,
+    }));
+    addLog('Система', 'Зчитування зупинено', 400);
   };
 
   const handleExportToSheets = async () => {
@@ -651,6 +636,7 @@ export default function ExtensionPopup() {
                 setDateTo={setDateTo}
                 status={status}
                 onFetch={handleFetchData}
+                onStop={handleStopDefault}
                 onClear={handleClear}
                 isLoading={isLoadingFetch}
                 canInsert={canInsert}
@@ -665,8 +651,11 @@ export default function ExtensionPopup() {
                 isFetchingOrchard={isLoadingFetch && activeFetchSite === 'site2'}
                 site1FetchBytes={fetchBytes.site1}
                 site2FetchBytes={fetchBytes.site2}
+                fetchError={defaultFetchError}
+                needsTabs={defaultNeedsTabs}
               />
             )}
+            {appMode === 'pms' && <PmsMode />}
             {appMode === 'shift_statistic' && <ShiftStatisticMode />}
             {appMode === 'workload' && <WorkloadMode />}
             {appMode === 'custom_reports' && <CustomReportsMode />}
@@ -686,6 +675,7 @@ export default function ExtensionPopup() {
                 className="bg-transparent text-[11px] font-medium text-gray-600 border-none focus:ring-0 p-0 text-right cursor-pointer outline-none w-auto"
               >
                 <option value="default">Default</option>
+                <option value="pms">PMS</option>
                 <option value="shift_statistic">Shift statistic</option>
                 <option value="workload">Workload</option>
                 <option value="custom_reports">Custom Reports</option>
@@ -738,6 +728,7 @@ export default function ExtensionPopup() {
               {appMode === 'shift_statistic' && <ShiftStatisticSettings />}
               {appMode === 'workload' && <WorkloadSettings />}
               {appMode === 'custom_reports' && <CustomReportsSettings />}
+              {appMode === 'pms' && <PmsSettings />}
             </div>
 
             {/* 3. ФІКСОВАНИЙ ФУТЕР: Кнопка логауту (Ультра-компактна) */}

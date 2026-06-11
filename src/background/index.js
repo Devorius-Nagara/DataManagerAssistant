@@ -1,8 +1,9 @@
 import { logToPopup, readFromStorage, setFetchFlag, convertDateTimeToMs, DATA_KEYS } from './shared.js';
 import { fetchTags, fetchTrackensureUsers, fetchAllTasks, fetchDisputeTasks, fetchComplainsTasks, fetchTaskHistories, fetchWorkloadTasks, fetchQueues, fetchCallHistory, STORAGE_USERS_KEY } from './api/trackensure.js';
 import { fetchOrchardTeams, fetchAllOrchardShifts, ensureOrchardToken, fetchAgentWorkHours, fetchOrchardDepartments, fetchOrchardTeamsByDept, fetchWorkloadSchedules, fetchWorkloadActualHours } from './api/orchard.js';
-import { fetchSheetValuesBg, executeSheetsBatch, exportCustomReport, exportWorkloadReport } from './api/sheets.js';
+import { fetchSheetValuesBg, executeSheetsBatch, exportCustomReport, exportWorkloadReport, exportPmsReport, exportPmsToSheets, exportProdToSheets } from './api/sheets.js';
 import { buildSheetMatrix, mapMatrixToUpdatesBg, inferMonthYear, aggregateData, aggregateTrackensure } from './modes/defaultModeBuilder.js';
+import { buildSheetMatrix as pmsBuildSheetMatrix, mapMatrixToUpdatesBg as pmsMapMatrixToUpdatesBg, inferMonthYear as pmsInferMonthYear, aggregateData as pmsAggregateData } from './modes/pmsModeBuilder.js';
 import { buildWorkloadStats, buildWorkloadMatrix } from './modes/workloadModeBuilder.js';
 
 let site1Cache = [];
@@ -11,6 +12,8 @@ let aggregationOptions = { includeCancel5: true, includeShift20: true };
 let debugSaved = false;
 let workloadStopRequested = false;
 const workloadGetStop = () => workloadStopRequested;
+let defaultStopRequested = false;
+let pmsStopRequested = false;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const type = message?.type || message?.action;
@@ -70,6 +73,85 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .finally(() => setFetchFlag(false));
       return true;
     }
+    case 'STOP_DEFAULT_FETCH':
+      defaultStopRequested = true;
+      sendResponse({ ok: true });
+      return false;
+
+    case 'FETCH_DEFAULT_DATA': {
+      (async () => {
+        try {
+          defaultStopRequested = false;
+          const {
+            tagId, teamId, tlIds = [], dateFrom, dateTo,
+            apiRangeOffset = 2, orchardOffset = 2,
+            includeCancel5 = true, includeShift20 = true,
+          } = message.payload || {};
+
+          aggregationOptions = { includeCancel5: Boolean(includeCancel5), includeShift20: Boolean(includeShift20) };
+          const dateFromMs = convertDateTimeToMs(dateFrom, apiRangeOffset);
+          const dateToMs   = dateTo?.includes('T')
+            ? convertDateTimeToMs(dateTo, apiRangeOffset)
+            : convertDateTimeToMs(`${dateTo}T23:59`, apiRangeOffset);
+
+          // ── Phase 1: TrackEnsure ────────────────────────────────────────
+          chrome.runtime.sendMessage({ type: 'DEFAULT_PHASE', phase: 'te_start' });
+          logToPopup('Default', 'Збір TrackEnsure тасків...', null);
+          try {
+            const data = await fetchAllTasks({ tagId, tlIds, dateFromMs, dateToMs });
+            if (defaultStopRequested) { sendResponse({ ok: false, error: 'Зупинено' }); return; }
+            site1Cache = data;
+            chrome.runtime.sendMessage({ type: 'DEFAULT_PHASE', phase: 'te_done', total: data.length });
+            logToPopup('Default', `TrackEnsure: ${data.length} записів`, 200);
+          } catch (err) {
+            chrome.runtime.sendMessage({ type: 'DEFAULT_PHASE', phase: 'te_error' });
+            const m = (err?.message || '').toLowerCase();
+            const isAuthErr = m.includes('401') || m.includes('403') || m.includes('token') ||
+                              m.includes('unauthorized') || m.includes('failed to fetch');
+            sendResponse({
+              ok: false,
+              needsTabs: isAuthErr,
+              error: isAuthErr
+                ? 'Будь ласка, відкрийте вкладки TrackEnsure та Orchard22 у браузері і повторіть спробу'
+                : (err?.message || 'Помилка TrackEnsure'),
+            });
+            return;
+          }
+
+          // ── Phase 2: Orchard ────────────────────────────────────────────
+          chrome.runtime.sendMessage({ type: 'DEFAULT_PHASE', phase: 'orchard_start' });
+          logToPopup('Default', 'Збір Orchard розкладів...', null);
+          try {
+            const data = await fetchAllOrchardShifts({ teamId, dateFromMs, dateToMs });
+            if (defaultStopRequested) { sendResponse({ ok: false, error: 'Зупинено' }); return; }
+            site2Cache = data;
+            chrome.runtime.sendMessage({ type: 'DEFAULT_PHASE', phase: 'orchard_done', total: data.length });
+            logToPopup('Default', `Orchard: ${data.length} записів`, 200);
+          } catch (err) {
+            chrome.runtime.sendMessage({ type: 'DEFAULT_PHASE', phase: 'orchard_error' });
+            const m = (err?.message || '').toLowerCase();
+            const isAuthErr = m.includes('401') || m.includes('403') || m.includes('token') ||
+                              m.includes('unauthorized') || m.includes('failed to fetch');
+            sendResponse({
+              ok: false,
+              needsTabs: isAuthErr,
+              error: isAuthErr
+                ? 'Будь ласка, відкрийте вкладки TrackEnsure та Orchard22 у браузері і повторіть спробу'
+                : (err?.message || 'Помилка Orchard'),
+            });
+            return;
+          }
+
+          trySendAggregateReport();
+          sendResponse({ ok: true, site1Total: site1Cache.length, site2Total: site2Cache.length });
+        } catch (err) {
+          console.error('[FETCH_DEFAULT_DATA] помилка:', err);
+          sendResponse({ ok: false, error: err?.message || 'Помилка зчитування' });
+        }
+      })();
+      return true;
+    }
+
     case 'START_FETCH_CONTEXT': {
       const {
         tagId,
@@ -390,6 +472,161 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: true });
       return false;
     }
+
+    case 'FETCH_PMS_DATA': {
+      // ── Exact clone of FETCH_DEFAULT_DATA, fully isolated in pms* storage keys ──
+      (async () => {
+        try {
+          pmsStopRequested = false;
+          const {
+            tagId, teamId, tlIds = [], dateFrom, dateTo,
+            apiRangeOffset = 2, orchardOffset = 2,
+            includeCancel5 = true, includeShift20 = true,
+          } = message.payload || {};
+
+          const dateFromMs = convertDateTimeToMs(dateFrom, apiRangeOffset);
+          const dateToMs   = dateTo?.includes('T')
+            ? convertDateTimeToMs(dateTo, apiRangeOffset)
+            : convertDateTimeToMs(`${dateTo}T23:59`, apiRangeOffset);
+
+          // Persist settings so handlePmsStartExport can read them during export
+          await chrome.storage.local.set({
+            pmsDateFrom:      dateFrom,
+            pmsDateTo:        dateTo,
+            pmsOrchardOffset: orchardOffset,
+            pmsIncludeCancel5: includeCancel5,
+            pmsIncludeShift20: includeShift20,
+            pmsSelectedTLs:   tlIds,
+          });
+
+          // ── Phase 1: TrackEnsure ────────────────────────────────────────
+          chrome.runtime.sendMessage({ type: 'PMS_PHASE', phase: 'te_start' });
+          logToPopup('PMS', 'Збір TrackEnsure тасків...', null);
+          let tasks;
+          try {
+            tasks = await fetchAllTasks({ tagId, tlIds, dateFromMs, dateToMs });
+            if (pmsStopRequested) { sendResponse({ ok: false, error: 'Зупинено' }); return; }
+            chrome.runtime.sendMessage({ type: 'PMS_PHASE', phase: 'te_done', total: tasks.length });
+            logToPopup('PMS', `TrackEnsure: ${tasks.length} тасків`, 200);
+          } catch (err) {
+            chrome.runtime.sendMessage({ type: 'PMS_PHASE', phase: 'te_error' });
+            const m = (err?.message || '').toLowerCase();
+            const isAuth = m.includes('401') || m.includes('403') || m.includes('token') ||
+                           m.includes('unauthorized') || m.includes('failed to fetch');
+            sendResponse({
+              ok: false,
+              needsTabs: isAuth,
+              error: isAuth
+                ? 'Будь ласка, відкрийте вкладки TrackEnsure та Orchard22 і повторіть спробу'
+                : (err?.message || 'Помилка TrackEnsure'),
+            });
+            return;
+          }
+
+          // ── Phase 2: Orchard ────────────────────────────────────────────
+          chrome.runtime.sendMessage({ type: 'PMS_PHASE', phase: 'orchard_start' });
+          logToPopup('PMS', 'Збір Orchard розкладів...', null);
+          let schedules;
+          try {
+            schedules = await fetchAllOrchardShifts({ teamId, dateFromMs, dateToMs });
+            if (pmsStopRequested) { sendResponse({ ok: false, error: 'Зупинено' }); return; }
+            chrome.runtime.sendMessage({ type: 'PMS_PHASE', phase: 'orchard_done', total: schedules.length });
+            logToPopup('PMS', `Orchard: ${schedules.length} записів`, 200);
+          } catch (err) {
+            chrome.runtime.sendMessage({ type: 'PMS_PHASE', phase: 'orchard_error' });
+            const m = (err?.message || '').toLowerCase();
+            const isAuth = m.includes('401') || m.includes('403') || m.includes('token') ||
+                           m.includes('unauthorized') || m.includes('failed to fetch');
+            sendResponse({
+              ok: false,
+              needsTabs: isAuth,
+              error: isAuth
+                ? 'Будь ласка, відкрийте вкладки TrackEnsure та Orchard22 і повторіть спробу'
+                : (err?.message || 'Помилка Orchard'),
+            });
+            return;
+          }
+
+          // Store PMS data in isolated keys — Default mode's trackensureData/orchardData untouched
+          await chrome.storage.local.set({ pmsRawTasks: tasks, pmsRawSchedules: schedules });
+          pmsTrySendAggregateReport();
+          logToPopup('PMS', `Готово: TE ${tasks.length} / Orchard ${schedules.length}`, 200);
+          sendResponse({ ok: true, site1Total: tasks.length, site2Total: schedules.length });
+        } catch (err) {
+          console.error('[FETCH_PMS_DATA] помилка:', err);
+          sendResponse({ ok: false, error: err?.message || 'Помилка зчитування' });
+        }
+      })();
+      return true;
+    }
+
+    case 'EXPORT_PMS_REPORT': {
+      (async () => {
+        try {
+          await handlePmsStartExport(message.payload);
+          sendResponse({ ok: true });
+        } catch (err) {
+          console.error('[ЕКСПОРТ КРИТИЧНА ПОМИЛКА] PMS:', err);
+          chrome.runtime.sendMessage({ action: 'PMS_EXPORT_COMPLETED', error: err.message });
+          sendResponse({ ok: false, error: err.message, status: 'Error' });
+        }
+      })();
+      return true;
+    }
+
+    case 'EXPORT_PROD_REPORT': {
+      (async () => {
+        try {
+          await handleProdStartExport(message.payload);
+          sendResponse({ ok: true });
+        } catch (err) {
+          console.error('[ЕКСПОРТ КРИТИЧНА ПОМИЛКА] PROD:', err);
+          chrome.runtime.sendMessage({ action: 'PMS_EXPORT_COMPLETED', error: err.message });
+          sendResponse({ ok: false, error: err.message, status: 'Error' });
+        }
+      })();
+      return true;
+    }
+
+    case 'CLEAR_PMS_DATA': {
+      chrome.storage.local.remove(['pmsRawTasks', 'pmsRawSchedules', 'pmsMissingAgents', 'pmsPendingBatchData']);
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    case 'STOP_PMS_FETCH': {
+      pmsStopRequested = true;
+      logToPopup('PMS', 'Зупинено користувачем', null);
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    case 'EXECUTE_PMS_SHEETS_BATCH': {
+      (async () => {
+        try {
+          const { sheetId, token } = message.payload || {};
+          const stored = await chrome.storage.local.get(['pmsPendingBatchData']);
+          const batchUpdateData = stored.pmsPendingBatchData;
+
+          if (!Array.isArray(batchUpdateData) || !batchUpdateData.length) {
+            sendResponse({ ok: false, error: 'Немає даних для запису (pmsPendingBatchData порожній)' });
+            return;
+          }
+
+          console.log('[EXECUTE_PMS_SHEETS_BATCH] Записую', batchUpdateData.length, 'діапазонів');
+          const resp = await executeSheetsBatch({ sheetId, token, batchUpdateData });
+          await chrome.storage.local.remove(['pmsMissingAgents', 'pmsPendingBatchData']);
+          chrome.runtime.sendMessage({ action: 'PMS_EXPORT_COMPLETED' });
+          sendResponse({ ok: true, result: resp });
+        } catch (err) {
+          console.error('[EXECUTE_PMS_SHEETS_BATCH] помилка:', err);
+          chrome.runtime.sendMessage({ action: 'PMS_EXPORT_COMPLETED', error: err?.message });
+          sendResponse({ ok: false, error: err?.message || 'Помилка запису в Sheets' });
+        }
+      })();
+      return true;
+    }
+
     default:
       return false;
   }
@@ -629,6 +866,330 @@ function buildComplainsMatrix(tasks, trackensureOffset = 2) {
   });
 
   return [headers, ...rows];
+}
+
+// ── PMS export — exact clone of handleStartExport, reads from pms* storage keys ──────────────────
+async function handlePmsStartExport(payload) {
+  const token = payload?.token;
+  if (!token) throw new Error('Не отримано токен!');
+
+  // Read PMS data and settings from isolated storage keys
+  const stored = await chrome.storage.local.get([
+    'pmsRawTasks', 'pmsRawSchedules',
+    'pmsDateFrom', 'pmsDateTo', 'pmsOrchardOffset', 'pmsIncludeCancel5', 'pmsIncludeShift20', 'pmsSelectedTLs',
+  ]);
+
+  const tasks     = stored.pmsRawTasks     || [];
+  const schedules = stored.pmsRawSchedules || [];
+  if (!tasks.length || !schedules.length) {
+    throw new Error('Немає PMS даних. Спочатку запустіть зчитування.');
+  }
+
+  const orchardOffset  = Number(stored.pmsOrchardOffset  ?? payload.orchardOffset  ?? 2);
+  const includeCancel5 = stored.pmsIncludeCancel5 !== false;
+  const includeShift20 = stored.pmsIncludeShift20 !== false;
+  const selectedTLs    = stored.pmsSelectedTLs  || payload.selectedTLs || [];
+  const timezone       = payload.timezone || 'Europe/Kyiv';
+  const tlCache        = (await readFromStorage(STORAGE_USERS_KEY)) || [];
+  const pmsDateFrom    = stored.pmsDateFrom || payload.dateFrom;
+  const baseDateFromMs = pmsDateFrom ? convertDateTimeToMs(pmsDateFrom, orchardOffset) : null;
+
+  // Fetch work hours for "L" marker — same as handleGetTsvMatrix
+  let agentWorkHoursCache = {};
+  try {
+    const orchardToken = await ensureOrchardToken();
+    if (orchardToken) {
+      const uniqueAgentIds = new Set();
+      schedules.forEach((entry) => {
+        const agId = entry?.agentDTO?.userId || entry?.agentDTO?.agentId || entry?.agentId;
+        if (agId) uniqueAgentIds.add(agId);
+      });
+      agentWorkHoursCache = await fetchAgentWorkHours({
+        token: orchardToken,
+        agentIds: uniqueAgentIds,
+        dateFromMs: baseDateFromMs,
+        dateToMs: Date.now(),
+      });
+    }
+  } catch (e) {
+    console.error('[PMS EXPORT] Work hours error (non-fatal):', e);
+  }
+
+  // Build matrix — pms clone of Default mode function
+  const rows = pmsBuildSheetMatrix(tasks, schedules, tlCache, {
+    includeCancel5, includeShift20, selectedTLs, timezone, orchardOffset,
+    baseDateFromMs, agentWorkHoursCache,
+  });
+
+  if (!rows || rows.length <= 1) {
+    throw new Error('Матриця порожня — перевірте дані або налаштування PMS');
+  }
+
+  // Infer month/year from PMS data — pms clone of Default mode function
+  const monthYear = pmsInferMonthYear(null, null, tasks, schedules);
+
+  // Read and validate the sheet — pms clone of Default mode approach
+  const sheetValues = await fetchSheetValuesBg(payload.sheetId, token);
+  const { updates: batchData, missingAgents } = pmsMapMatrixToUpdatesBg(rows, sheetValues, monthYear, orchardOffset);
+
+  // ── DEBUG: Фінальний payload для рядків 13-33 (перші 4 агенти) ──────────────
+  {
+    const targetRows = Array.from({ length: 21 }, (_, i) => i + 13);
+    const debugPayload = batchData.filter((item) => {
+      const match = item.range.match(/\d+$/);
+      return match ? targetRows.includes(parseInt(match[0], 10)) : false;
+    });
+    console.log(`[ФІНАЛЬНИЙ ПЕЙЛОАД] Всього записів для рядків 13-33:`, debugPayload.length);
+    if (debugPayload.length > 0) {
+      console.log(`[ФІНАЛЬНИЙ ПЕЙЛОАД] Деталі (перші 20):`, JSON.stringify(debugPayload.slice(0, 20), null, 2));
+    } else {
+      console.log(`[ФІНАЛЬНИЙ ПЕЙЛОАД] ❌ Жодного запису для рядків 13-33. Всього в batchData:`, batchData.length, '| Відсутні агенти:', missingAgents.length, missingAgents);
+      console.log(`[ФІНАЛЬНИЙ ПЕЙЛОАД] Всі унікальні рядки в batchData:`, [...new Set(batchData.map(i => { const m = i.range.match(/\d+$/); return m ? parseInt(m[0]) : '?'; }))].sort((a,b)=>a-b));
+    }
+
+    const rangeCounts = {};
+    batchData.forEach((item) => {
+      if (!rangeCounts[item.range]) rangeCounts[item.range] = [];
+      rangeCounts[item.range].push(item.values[0][0]);
+    });
+    const overwriteIssues = Object.entries(rangeCounts)
+      .filter(([, vals]) => vals.length > 1)
+      .map(([range, values]) => ({ range, values }));
+    if (overwriteIssues.length > 0) {
+      console.log(`[КРИТИЧНО] Знайдено дублікати діапазонів! Клітинки перезаписуються:`, overwriteIssues);
+    } else {
+      console.log(`[ФІНАЛЬНИЙ ПЕЙЛОАД] Дублікатів діапазонів не знайдено.`);
+    }
+
+    const zeroOrEmpty = batchData.filter((item) => {
+      const v = item.values?.[0]?.[0];
+      return v === '' || v === 0 || v === '0' || v == null;
+    });
+    if (zeroOrEmpty.length > 0) {
+      console.log(`[ФІНАЛЬНИЙ ПЕЙЛОАД] ⚠️ Знайдено ${zeroOrEmpty.length} записів з нульовим/порожнім значенням:`, JSON.stringify(zeroOrEmpty.slice(0, 10), null, 2));
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  if (!batchData.length && !missingAgents.length) {
+    throw new Error('Відсутні дані для запису — перевірте, чи правильний місяць у рядку 2 таблиці');
+  }
+
+  if (missingAgents.length > 0) {
+    // Same missing-agents flow as Default mode, but uses pms* keys
+    await chrome.storage.local.set({ pmsMissingAgents: missingAgents, pmsPendingBatchData: batchData });
+    chrome.runtime.sendMessage({ action: 'PMS_EXPORT_COMPLETED' });
+    return;
+  }
+
+  await executeSheetsBatch({ sheetId: payload.sheetId, token, batchUpdateData: batchData });
+  chrome.runtime.sendMessage({ action: 'PMS_EXPORT_COMPLETED' });
+
+  try {
+    chrome.notifications.create({
+      type: 'basic', iconUrl: 'assets/icon128.png',
+      title: 'PMS Експорт завершено',
+      message: `Записано ${batchData.length} оновлень у Google Таблицю!`,
+    });
+  } catch { /* non-fatal */ }
+}
+
+async function handleProdStartExport(payload) {
+  console.log('[PROD.MOD] Починаю експорт...');
+
+  const token = payload?.token;
+  if (!token) throw new Error('Не отримано токен!');
+
+  const stored = await chrome.storage.local.get([
+    'pmsRawTasks', 'pmsRawSchedules',
+    'pmsDateFrom', 'pmsOrchardOffset', 'pmsIncludeCancel5', 'pmsIncludeShift20', 'pmsSelectedTLs',
+  ]);
+
+  const tasks     = stored.pmsRawTasks     || [];
+  const schedules = stored.pmsRawSchedules || [];
+  console.log('[PROD.MOD] Завантажено з storage: tasks =', tasks.length, ', schedules =', schedules.length);
+  if (!tasks.length || !schedules.length) {
+    throw new Error('Немає PMS даних. Спочатку запустіть зчитування.');
+  }
+
+  const orchardOffset  = Number(stored.pmsOrchardOffset  ?? payload.orchardOffset  ?? 2);
+  const includeCancel5 = stored.pmsIncludeCancel5 !== false;
+  const includeShift20 = stored.pmsIncludeShift20 !== false;
+  const selectedTLs    = stored.pmsSelectedTLs  || payload.selectedTLs || [];
+  const timezone       = payload.timezone || 'Europe/Kyiv';
+  const tlCache        = (await readFromStorage(STORAGE_USERS_KEY)) || [];
+  const pmsDateFrom    = stored.pmsDateFrom || payload.dateFrom;
+  const pmsDateTo      = stored.pmsDateTo   || payload.dateTo;
+  const baseDateFromMs = pmsDateFrom ? convertDateTimeToMs(pmsDateFrom, orchardOffset) : null;
+
+  console.log('[PROD.MOD] Будую матрицю (pmsBuildSheetMatrix)...');
+  const rows = pmsBuildSheetMatrix(tasks, schedules, tlCache, {
+    includeCancel5, includeShift20, selectedTLs, timezone, orchardOffset,
+    baseDateFromMs, agentWorkHoursCache: {},
+  });
+  console.log('[PROD.MOD] Матриця побудована, рядків:', rows?.length ?? 0);
+
+  if (!rows || rows.length <= 1) {
+    throw new Error('Матриця порожня — перевірте дані або налаштування PMS');
+  }
+
+  console.log('[PROD.MOD] Зчитую лист Productivity для карти рядків...');
+  const prodSheetValues = await fetchSheetValuesBg(payload.sheetId, token, 'Productivity!A:A');
+  const prodRowCount = prodSheetValues?.values?.length ?? 0;
+  console.log('[PROD.MOD] Карта рядків побудована, знайдено рядків у Productivity:', prodRowCount);
+
+  // ── Збираємо рейти агентів з Orchard ─────────────────────────────────────────
+  // TODO: тимчасово вимкнено
+  // const rateMap = {};
+  // ...
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── Збираємо відпрацьований час (Total Hours) з Orchard ──────────────────────
+  console.log('[PROD.MOD] Збираю відпрацьований час агентів...');
+  const wkDateFromMs = baseDateFromMs;
+
+  // Fallback: якщо pmsDateTo не збережено (старий fetch), реконструюємо кінець місяця
+  let wkDateToMs = pmsDateTo
+    ? convertDateTimeToMs(pmsDateTo.includes('T') ? pmsDateTo : `${pmsDateTo}T23:59`, orchardOffset)
+    : null;
+  if (!wkDateToMs && wkDateFromMs) {
+    const d = new Date(wkDateFromMs + orchardOffset * 3600000); // локальний час
+    const endOfMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0, 23, 59, 0));
+    wkDateToMs = endOfMonth.getTime() - orchardOffset * 3600000;
+    console.log('[PROD WORK HOURS] pmsDateTo відсутній — реконструйовано кінець місяця:', new Date(wkDateToMs).toISOString());
+  }
+
+  // workHoursMap: agentName → totalHours; після збору інжектуємо у PMS_TIME rows матриці
+  const workHoursMap = {};
+
+  if (wkDateFromMs && wkDateToMs) {
+    console.log('[PROD WORK HOURS] Дати запиту:', new Date(wkDateFromMs).toISOString(), '→', new Date(wkDateToMs).toISOString());
+    try {
+      const orchardToken = await ensureOrchardToken();
+      if (orchardToken) {
+        const orchardHeaders = {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: `Bearer ${orchardToken}`,
+        };
+        const seenIds = new Set();
+        for (const entry of schedules) {
+          const agentId   = entry?.agentDTO?.userId || entry?.agentDTO?.agentId || entry?.agentId || entry?.candidateId;
+          const agentName = entry?.agentDTO?.fullName || entry?.agentName;
+          if (!agentId || !agentName || seenIds.has(agentId)) continue;
+          seenIds.add(agentId);
+
+          const isDebugAgent = agentName.includes('Anastasiia') || agentName.includes('Artem');
+          const reqPayload = { agentId, cutOff: true, dateFrom: wkDateFromMs, dateTo: wkDateToMs };
+          if (isDebugAgent) {
+            console.log(`\n[DEBUG WORK HOURS] === Агент: ${agentName} ===`);
+            console.log('[DEBUG WORK HOURS] Payload:', reqPayload);
+          }
+
+          try {
+            const res = await fetch('https://orchard22.com/api/calendar/work-hour/list-by-filter', {
+              method: 'POST',
+              credentials: 'include',
+              headers: orchardHeaders,
+              body: JSON.stringify(reqPayload),
+            });
+
+            if (isDebugAgent) {
+              console.log(`[DEBUG WORK HOURS] Response status: ${res.status} ${res.statusText}`);
+            }
+
+            if (res.ok) {
+              const data = await res.json();
+              let totalMs = 0;
+              if (Array.isArray(data)) data.forEach((item) => { totalMs += Number(item.workTimeMs) || 0; });
+              const totalHours = Math.round((totalMs / 3600000) * 100) / 100;
+              workHoursMap[agentName] = totalHours;
+
+              if (isDebugAgent) {
+                console.log(`[DEBUG WORK HOURS] Знайдено записів: ${Array.isArray(data) ? data.length : 0}`);
+                console.log(`[DEBUG WORK HOURS] Сума totalMs: ${totalMs}`);
+                console.log(`[DEBUG WORK HOURS] Фінальні Total Hours: ${totalHours}\n`);
+              }
+            } else {
+              const errText = await res.text().catch(() => '');
+              console.error(`[DEBUG WORK HOURS ERROR] Server error для ${agentName} (${res.status}):`, errText);
+              workHoursMap[agentName] = 0;
+            }
+          } catch (err) {
+            console.error(`[DEBUG WORK HOURS ERROR] Fetch failed для ${agentName}:`, err);
+            workHoursMap[agentName] = 0;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[PROD WORK HOURS] Не вдалося отримати токен Orchard:', e);
+    }
+  } else {
+    console.warn('[PROD WORK HOURS] Відсутні дати — пропускаємо збір відпрацьованого часу');
+  }
+  console.log('[PROD.MOD] Відпрацьований час зібрано для', Object.keys(workHoursMap).length, 'агентів');
+
+  // Інжектуємо prodTotalHours у PMS_TIME rows матриці як row[11]
+  // Це усуває потребу в map-лукапі по імені в exportProdToSheets
+  {
+    let injectAgent = null;
+    for (const row of rows) {
+      const label = String(row[0] || '');
+      if (label.startsWith('PMS_MAIN:')) { injectAgent = label.slice('PMS_MAIN:'.length); continue; }
+      if (label === 'PMS_TIME:' && injectAgent) {
+        row[11] = workHoursMap[injectAgent] ?? 0;
+        injectAgent = null;
+      }
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  console.log('[PROD.MOD] Викликаю exportProdToSheets...');
+  const { notFoundAgents, updatesCount } = await exportProdToSheets({
+    token,
+    spreadsheetId: payload.sheetId,
+    matrixRows: rows,
+    prodSheetValues,
+    // rateMap,  // TODO: тимчасово вимкнено
+  });
+  console.log('[PROD.MOD] Експорт завершено успішно! Оновлень:', updatesCount, '| Не знайдено:', notFoundAgents);
+
+  chrome.runtime.sendMessage({ action: 'PMS_EXPORT_COMPLETED' });
+
+  try {
+    const notFoundMsg = notFoundAgents.length > 0 ? ` (не знайдено: ${notFoundAgents.join(', ')})` : '';
+    chrome.notifications.create({
+      type: 'basic', iconUrl: 'assets/icon128.png',
+      title: 'Prod.Mod Експорт завершено',
+      message: `Записано ${updatesCount} оновлень у лист Productivity!${notFoundMsg}`,
+    });
+  } catch { /* non-fatal */ }
+}
+
+function pmsTrySendAggregateReport() {
+  chrome.storage.local.get(
+    ['pmsRawTasks', 'pmsRawSchedules', STORAGE_USERS_KEY, 'pmsTLIds', 'pmsIncludeCancel5', 'pmsIncludeShift20', 'pmsOrchardOffset'],
+    (data) => {
+      const tasks     = data.pmsRawTasks     || [];
+      const schedules = data.pmsRawSchedules || [];
+      if (!tasks.length || !schedules.length) return;
+
+      const tlCache = data?.[STORAGE_USERS_KEY] || [];
+      const options = {
+        includeCancel5: data?.pmsIncludeCancel5 !== false,
+        includeShift20: data?.pmsIncludeShift20 !== false,
+        selectedTLs:    data?.pmsTLIds          || [],
+        orchardOffset:  Number(data?.pmsOrchardOffset ?? 2),
+      };
+      const { agentMessage, tlMessage } = pmsAggregateData(tasks, schedules, tlCache, options);
+      if (agentMessage) {
+        chrome.runtime.sendMessage({ type: 'LOG', site: 'PMS', message: agentMessage, code: 200 });
+      }
+      if (tlMessage) {
+        chrome.runtime.sendMessage({ type: 'LOG', site: 'PMS', message: tlMessage, code: 200 });
+      }
+    }
+  );
 }
 
 function trySendAggregateReport() {

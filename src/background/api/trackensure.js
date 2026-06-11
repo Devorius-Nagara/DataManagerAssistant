@@ -199,7 +199,17 @@ async function fetchTasksPaginated({ dateFrom, dateTo, tagId, taskTeamLeaderId, 
       logToPopup('Сайт 1', 'Отримано 0 записів', status || 200, { taskTeamLeaderId, tagId });
       break;
     }
-    const enriched = tasks.map((t) => ({ ...t, origin: origin?.type || 'tag', originTLId: origin?.tlId, originTLName: origin?.tlName }));
+    const enriched = tasks.map((t) => ({
+      ...t,
+      origin: origin?.type || 'tag',
+      originTLId: origin?.tlId,
+      originTLName: origin?.tlName,
+      // Explicitly forward time fields so they survive any future refactor of the spread
+      inProgressSpendTimeSec:  t.inProgressSpendTimeSec,
+      totalSpentTimeSec:       t.totalSpentTimeSec,
+      actualTotalSpentTimeSec: t.actualTotalSpentTimeSec,
+      totalNoChargeTimeSec:    t.totalNoChargeTimeSec,
+    }));
     const sampleTask = tasks[0] || {};
     logToPopup(
       'Сайт 1',
